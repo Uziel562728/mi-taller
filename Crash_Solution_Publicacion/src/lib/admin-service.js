@@ -1,4 +1,5 @@
 import { supabase } from './supabase.js'
+import { applicationUrl } from './app-url.js'
 
 const messages = {
   AUTH_REQUIRED: 'Iniciá sesión para realizar esta operación.',
@@ -123,9 +124,9 @@ export async function sendWorkshopInvitation(payload, client = supabase) {
   return record.promise
 }
 
-export function buildInvitationRedirect(location = globalThis.window?.location) {
+export function buildInvitationRedirect(location = globalThis.window?.location, basePath) {
   if (!location) return undefined
-  const url = new URL('./', location.href)
+  const url = new URL(applicationUrl(location, basePath))
   url.search = ''
   url.hash = 'update-password'
   return url.href

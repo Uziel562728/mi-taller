@@ -19,6 +19,47 @@ function environment(controlled = true) {
 }
 
 describe('Service Worker y Vite', () => {
+  it('registra Pages en su subcarpeta sin borrar cachés de otros proyectos', async () => {
+    const env = environment(false)
+    env.location = { href: 'https://uziel562728.github.io/mi-taller/?tracking=1#/stock', protocol: 'https:', hostname: 'uziel562728.github.io', reload: vi.fn() }
+    await configureServiceWorker({ isDev: false, basePath: '/mi-taller/', ...env })
+    expect(env.navigator.serviceWorker.register).toHaveBeenCalledWith('https://uziel562728.github.io/mi-taller/sw.js', { scope: 'https://uziel562728.github.io/mi-taller/', updateViaCache: 'none' })
+    expect(env.caches.delete).not.toHaveBeenCalled()
+  })
+
+  it('la actualización espera a que se guarde y solo recarga una vez después de aceptar', async () => {
+    const env = environment(), listeners = {}, onUpdate = vi.fn(), beforeUpdate = vi.fn(async () => true)
+    const waiting = { postMessage: vi.fn() }
+    const registration = { waiting, update: vi.fn(), addEventListener: vi.fn() }
+    env.navigator.serviceWorker.register.mockResolvedValue(registration)
+    env.navigator.serviceWorker.addEventListener = (name, handler) => { listeners[name] = handler }
+    env.navigator.serviceWorker.controller.postMessage = vi.fn()
+    const pending = localStorage.getItem('pending-jobs')
+    await configureServiceWorker({ isDev: false, version: 'v2', onUpdate, beforeUpdate, ...env })
+    expect(onUpdate).toHaveBeenCalled()
+    expect(waiting.postMessage).not.toHaveBeenCalled()
+    expect(env.location.reload).not.toHaveBeenCalled()
+    await onUpdate.mock.calls[0][0]()
+    expect(beforeUpdate).toHaveBeenCalledOnce()
+    expect(waiting.postMessage).toHaveBeenCalledExactlyOnceWith({ type: 'ACTIVATE_UPDATE' })
+    listeners.controllerchange(); listeners.controllerchange()
+    expect(env.location.reload).toHaveBeenCalledOnce()
+    expect(localStorage.getItem('pending-jobs')).toBe(pending)
+  })
+
+  it('un fallo de guardado impide activar y recargar; otra pestaña no recarga automáticamente', async () => {
+    const env = environment(), listeners = {}, onUpdate = vi.fn()
+    const waiting = { postMessage: vi.fn() }
+    env.navigator.serviceWorker.register.mockResolvedValue({ waiting })
+    env.navigator.serviceWorker.addEventListener = (name, handler) => { listeners[name] = handler }
+    const result = await configureServiceWorker({ isDev: false, onUpdate, beforeUpdate: async () => false, ...env })
+    expect(await result.applyUpdate()).toBe(false)
+    expect(waiting.postMessage).not.toHaveBeenCalled()
+    listeners.controllerchange()
+    expect(env.location.reload).not.toHaveBeenCalled()
+    expect(onUpdate).toHaveBeenCalled()
+  })
+
   it('en desarrollo retira el worker anterior, borra solo el app shell y libera el documento controlado', async () => {
     const env = environment()
     localStorage.setItem('pending-jobs', 'conservar')

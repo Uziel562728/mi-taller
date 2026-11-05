@@ -130,9 +130,11 @@ describe('Handler real de admin-management con Auth/DB/correo simulados', () => 
     for (const redirectTo of ['https://evil.example/#update-password', `${origin}/?access_token=private#update-password`, 'javascript:alert(1)', `${origin}/#wrong`]) {
       expect((await handler(request({ redirectTo }))).status).toBe(400)
     }
-    const response = await handler(request({ redirectTo: 'https://app.example.invalid/#update-password' }, { Origin: 'https://app.example.invalid' }))
-    expect(response.status).toBe(200)
-    expect(admin.auth.admin.inviteUserByEmail.mock.calls[0][1].redirectTo).toBe('https://app.example.invalid/#update-password')
+    for (const [index, root] of ['https://app.example.invalid/', 'https://uziel562728.github.io/mi-taller/'].entries()) {
+      const response = await handler(request({ email: `prueba${index}@example.invalid`, redirectTo: root + '#update-password' }, { Origin: new URL(root).origin }))
+      expect(response.status).toBe(200)
+      expect(admin.auth.admin.inviteUserByEmail.mock.lastCall[1].redirectTo).toBe(root + '#update-password')
+    }
   })
 
   it('preflight y diagnóstico son de solo lectura; no desactivan la comprobación de JWT o rol', async () => {

@@ -636,6 +636,18 @@ function getCurrentActiveScreenName() {
   return 'jobs'
 }
 
+export async function preparePwaUpdate() {
+  if (window.saveLocal?.(false) === false) return false
+  persistCurrentNavigationState()
+  const membership = getActiveMembership()
+  if (appAuthState.user?.id && membership?.workshop_id && window.active) {
+    // Local only: preserve the pending idempotent operation before any reload.
+    await enqueueJobSyncOperation({ userId: appAuthState.user.id, workshopId: membership.workshop_id, job: window.active })
+  }
+  return true
+}
+window.preparePwaUpdate = preparePwaUpdate
+
 export function persistCurrentNavigationState(overrides = {}, { capture = true } = {}) {
   if (!appAuthState.user?.id) return null
   if (appRouter && readAppRoute(window.location).name === 'password' && !overrides.screen) {

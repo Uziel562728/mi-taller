@@ -24,21 +24,40 @@ function retireDevelopmentWorker() {
 }
 
 function copyStaticPwaAssets() {
+  let base = '/'
   return {
     name: 'copy-static-pwa-assets',
-    generateBundle(_options, bundle) {
+    configResolved(config) { base = config.base },
+    generateBundle: { order: 'post', handler(_options, bundle) {
       const code = Object.keys(bundle).filter(name => /\.(js|css)$/.test(name))
       const vehiclesDir = join(appRoot, 'public', 'vehicle-assets')
       const vehicles = existsSync(vehiclesDir) ? readdirSync(vehiclesDir).map(name => `vehicle-assets/${name}`) : []
       const manifest = JSON.stringify([...code, ...vehicles])
-      this.emitFile({ type: 'asset', fileName: 'precache-manifest.json', source: manifest })
-      const revision = createHash('sha256').update(manifest).digest('hex').slice(0, 12)
-      this.emitFile({ type: 'asset', fileName: 'sw.js', source: readFileSync(join(appRoot, 'sw.js'), 'utf8').replace('crash-solution-shell-v4', `crash-solution-shell-v4-${revision}`) })
-    },
+      // Include HTML, worker and static files: an inline UI or icon change must
+      // create a new shell even when the compiled JS filenames do not change.
+      const hash = createHash('sha256').update(base).update(manifest)
+      for (const [name, entry] of Object.entries(bundle).sort(([a], [b]) => a.localeCompare(b))) {
+        hash.update(name).update(entry.type === 'chunk' ? entry.code : entry.source)
+      }
+      const hashFiles = directory => {
+        for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+          const path = join(directory, entry.name)
+          if (entry.isDirectory()) hashFiles(path)
+          else hash.update(path.slice(appRoot.length)).update(readFileSync(path))
+        }
+      }
+      hashFiles(join(appRoot, 'public'))
+      hashFiles(join(appRoot, 'icons'))
+      const worker = readFileSync(join(appRoot, 'sw.js'), 'utf8')
+      const revision = hash.update(worker).digest('hex').slice(0, 16)
+      this.emitFile({ type: 'asset', fileName: 'precache-manifest.json', source: JSON.stringify({ version: revision, assets: [...code, ...vehicles] }) })
+      const html = bundle['index.html']
+      html.source = String(html.source).replace('</head>', `<meta name="app-build-version" content="${revision}"></head>`)
+      this.emitFile({ type: 'asset', fileName: 'sw.js', source: worker.replaceAll('__BUILD_VERSION__', revision) })
+    } },
     closeBundle() {
       if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true })
       const rootFiles = [
-        'manifest.webmanifest',
         '_headers',
         'auto_1_sedan_4_puertas.png',
         'auto_2_coupe_2_puertas.png',

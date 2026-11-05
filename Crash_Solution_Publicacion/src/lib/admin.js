@@ -300,7 +300,7 @@ export async function inviteOrCreateWorkshopUser({
     throw new Error('Seleccioná un taller antes de invitar a un usuario.')
   }
 
-  const redirectTo = buildInvitationRedirect()
+  const redirectTo = buildInvitationRedirect(globalThis.window?.location, import.meta.env.BASE_URL)
   return await sendWorkshopInvitation({
     action: 'invite_user',
     callerId,

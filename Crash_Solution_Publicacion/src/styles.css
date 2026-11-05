@@ -1,4 +1,7 @@
 /* Only the animation used by this application; retain reduced-motion support. */
+.pwa-update-notice { position: fixed; z-index: 110; bottom: 16px; right: 16px; width: min(400px, calc(100% - 32px)); padding: 18px; border: 1px solid #adc4dd; border-radius: 14px; background: #fff; color: #132c43; box-shadow: 0 5px 24px #132c4330; }
+.pwa-update-notice p { margin: 0 0 12px; }
+.pwa-update-notice .small { display: block; margin-top: 8px; }
 @keyframes profileFadeIn { from { opacity: 0; } to { opacity: 1; } }
 .animate__animated { animation-duration: .2s; animation-fill-mode: both; }
 .animate__fadeIn { animation-name: profileFadeIn; }

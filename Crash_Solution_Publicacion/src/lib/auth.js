@@ -1,4 +1,5 @@
 import { supabase, isSupabaseConfigured } from './supabase.js'
+import { applicationUrl } from './app-url.js'
 
 // Roles estrictamente admitidos por la restricción de base de datos en public.workshop_members
 export const VALID_WORKSHOP_ROLES = ['owner', 'admin', 'staff']
@@ -242,7 +243,7 @@ export async function signUpWithEmail(
 
   const redirectTo =
     typeof window !== 'undefined'
-      ? `${window.location.origin}${window.location.pathname}`
+      ? applicationUrl(window.location, import.meta.env.BASE_URL)
       : undefined
 
   const { data, error } = await client.auth.signUp({
@@ -307,7 +308,7 @@ export async function sendPasswordReset(email) {
 
   const redirectTo =
     typeof window !== 'undefined'
-      ? `${window.location.origin}${window.location.pathname}#update-password`
+      ? `${applicationUrl(window.location, import.meta.env.BASE_URL)}#update-password`
       : undefined
 
   const { error } = await supabase.auth.resetPasswordForEmail(emailCheck.value, {
