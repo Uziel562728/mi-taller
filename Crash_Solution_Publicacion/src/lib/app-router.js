@@ -1,5 +1,12 @@
 const STEPS = ['reception', 'inspection', 'budget']
-const HASHES = { jobs: '#/trabajos', stock: '#/stock', profile: '#/perfil', admin: '#/admin', password: '#update-password' }
+const HASHES = {
+  jobs: '#/trabajos',
+  stock: '#/stock',
+  profile: '#/perfil',
+  admin: '#/admin',
+  settings: '#/configuracion',
+  password: '#update-password'
+}
 
 export function routeHash(route) {
   if (route.name === 'work' && route.jobId) {
@@ -72,24 +79,36 @@ export function createAppRouter({ window: win, render, scope, onError = () => {}
     async navigate(route, { replace = false, snapshot, returnRoute, force = false } = {}) {
       const previous = ensureEntry()
       if (routeHash(route) === win.location.hash && !replace) return sync({ force })
+      const currentRoute = readAppRoute(win.location)
       const password = route.name === 'password'
       write(makeEntry({
         snapshot: snapshot ?? (password ? previous.snapshot : undefined),
-        returnRoute: password ? (returnRoute || readAppRoute(win.location)) : undefined,
-        backToApp: password && !replace
+        returnRoute: returnRoute || (!replace ? currentRoute : previous.returnRoute),
+        backToApp: !replace
       }), replace, route)
       return sync({ force: true })
     },
-    returnFromPassword() {
+    goBack(fallbackRoute = { name: 'jobs' }) {
       const entry = state()
       if (entry?.backToApp) {
         const done = new Promise(resolve => waiters.push(resolve))
         win.history.back()
         return done
       }
-      return this.navigate(entry?.returnRoute || routeForSnapshot(entry?.snapshot), {
-        replace: true, snapshot: entry?.snapshot
+      const current = readAppRoute(win.location)
+      const target =
+        (entry?.returnRoute && routeHash(entry.returnRoute) !== routeHash(current) ? entry.returnRoute : null) ||
+        (entry?.snapshot && routeHash(routeForSnapshot(entry.snapshot)) !== routeHash(current)
+          ? routeForSnapshot(entry.snapshot)
+          : null) ||
+        fallbackRoute
+      return this.navigate(target, {
+        replace: true,
+        snapshot: entry?.snapshot
       })
+    },
+    returnFromPassword() {
+      return this.goBack({ name: 'jobs' })
     },
     dispose() {
       win.removeEventListener('popstate', onLocationChange)

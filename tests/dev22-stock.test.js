@@ -26,7 +26,7 @@ describe('DEV-22 — Sistema de Stock, Compatibilidad Vehicular, Movimientos RPC
       description: 'Espejo eléctrico con desempañador',
       unit: 'un.',
       location: 'Estante B-3',
-      purchase_price: 42500.5,
+      purchase_price: 42500,
       sale_price: 68000,
       minimum_quantity: 2,
       initial_quantity: 5,

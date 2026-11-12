@@ -765,3 +765,523 @@
   .personal-profile-actions { flex-direction: column; }
   .personal-profile-actions .button { width: 100%; }
 }
+
+/* ==========================================================================
+   DEV-32 & DEV-33 — Diseño Unificado (referencia «Mi perfil»), Configuración y Acciones PDF
+   ========================================================================== */
+.unified-screen-top {
+  border-radius: var(--radius);
+  margin-bottom: 24px;
+  box-shadow: 0 12px 32px #132c431f;
+}
+
+.unified-screen-top h1 {
+  font-size: 30px;
+  letter-spacing: -0.8px;
+  margin: 0 0 8px;
+  color: #fff;
+}
+
+.unified-screen-top-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.settings-group-block {
+  padding-top: 14px;
+  margin-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.settings-group-block:first-child {
+  padding-top: 0;
+  margin-top: 0;
+  border-top: 0;
+}
+
+.settings-group-header {
+  margin-bottom: 12px;
+}
+
+.settings-group-header h3 {
+  font-size: 15px;
+  margin: 0 0 3px;
+}
+
+.settings-group-header p {
+  margin: 0;
+}
+
+.settings-checkbox-row {
+  display: flex !important;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: #f8fafd;
+  cursor: pointer;
+}
+
+.settings-checkbox-row input[type='checkbox'] {
+  width: 18px;
+  height: 18px;
+  min-height: 0;
+  margin: 2px 0 0;
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.pdf-feedback-message {
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+
+.pdf-actions-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+  padding-top: 10px;
+  border-top: 1px solid #b8e2cc;
+}
+
+.auth-alert.info .pdf-actions-bar {
+  border-top-color: #c5dafc;
+}
+
+.workshop-selector-card {
+  border-left: 4px solid var(--blue);
+}
+
+.workshop-selector-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.active-workshop-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  background: #f6f9fc;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.active-workshop-summary strong {
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.workshop-selector-controls {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.workshop-selector-label {
+  display: grid;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 700;
+  color: #4f6275;
+}
+
+.workshop-selector-card .workshop-switcher {
+  width: 100%;
+  max-width: 480px;
+  background: #fff;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  font-size: 14px;
+  font-weight: 650;
+  min-height: 44px;
+  padding: 10px 12px;
+}
+
+@media (max-width: 680px) {
+  .unified-screen-top {
+    padding: 18px 18px 22px;
+    border-radius: 16px;
+  }
+  .unified-screen-top h1 {
+    font-size: 24px;
+  }
+  .pdf-actions-bar {
+    flex-direction: column;
+  }
+  .pdf-actions-bar .button {
+    width: 100%;
+  }
+  .workshop-selector-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .workshop-selector-card .workshop-switcher {
+    max-width: 100%;
+  }
+}
+
+/* ==========================================================================
+   Sistema global de modales de error (#appErrorModal) e indicaciones de campo
+   ========================================================================== */
+.app-error-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  background: rgba(15, 23, 36, 0.62);
+  backdrop-filter: blur(3px);
+  opacity: 1;
+  transition: opacity 0.18s ease;
+}
+
+.app-error-modal-backdrop[hidden] {
+  display: none !important;
+}
+
+.app-error-modal {
+  width: min(500px, 100%);
+  max-height: calc(100vh - 36px);
+  overflow-y: auto;
+  background: #ffffff;
+  color: var(--ink, #172330);
+  border-radius: 18px;
+  border: 1px solid #e6cfd0;
+  box-shadow: 0 24px 54px rgba(15, 23, 36, 0.28);
+  padding: 22px 24px 20px;
+  transform: translateY(0) scale(1);
+  opacity: 1;
+  animation: appErrorModalEnter 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes appErrorModalEnter {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.app-error-modal-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.app-error-modal-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  background: #fdf1f1;
+  border: 1px solid #f2c6c6;
+  color: #b42318;
+  font-size: 20px;
+  font-weight: 850;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.app-error-modal-headings {
+  flex: 1;
+  min-width: 0;
+}
+
+.app-error-modal-headings .eyebrow {
+  display: block;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: #b42318;
+  margin-bottom: 3px;
+}
+
+.app-error-modal-headings h2 {
+  margin: 0;
+  font-size: 19px;
+  line-height: 1.25;
+  color: var(--ink, #172330);
+}
+
+.app-error-modal-x {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  border: 1px solid var(--line, #dbe3ec);
+  background: #f8fafc;
+  color: #4f6275;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.app-error-modal-x:hover {
+  background: #eef3f8;
+  color: var(--ink, #172330);
+}
+
+.app-error-modal-body {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.app-error-modal-message {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.5;
+  color: #243447;
+  font-weight: 600;
+}
+
+.app-error-modal-solution {
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: #f7fafc;
+  border: 1px solid #dbe4ee;
+  font-size: 13.5px;
+  line-height: 1.45;
+  color: #3b4d61;
+  display: grid;
+  gap: 4px;
+}
+
+.app-error-modal-solution strong {
+  color: #172330;
+  font-size: 12.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.app-error-modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding-top: 12px;
+  border-top: 1px solid var(--line, #dbe3ec);
+}
+
+.input-field-error,
+input.input-field-error,
+select.input-field-error,
+textarea.input-field-error {
+  border-color: #c93b2b !important;
+  background-color: #fffafa !important;
+  box-shadow: 0 0 0 3px rgba(201, 59, 43, 0.14) !important;
+}
+
+.field-error-hint {
+  display: block;
+  margin-top: 5px;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.35;
+  color: #b42318;
+}
+
+@media (max-width: 680px) {
+  .app-error-modal {
+    padding: 18px 16px 16px;
+    border-radius: 16px;
+  }
+  .app-error-modal-footer {
+    flex-direction: column-reverse;
+  }
+  .app-error-modal-footer .button {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-error-modal-backdrop,
+  .app-error-modal {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* ==========================================================================
+   DEV-35: Presupuesto agrupado por pieza e intervención (Chapa / Pintura)
+   ========================================================================== */
+.piece-quote-group {
+  border: 1px solid var(--line, #e1e7ed);
+  border-radius: 14px;
+  background: #fafcfe;
+  margin-bottom: 14px;
+  overflow: hidden;
+}
+
+.piece-quote-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  background: #eef3fa;
+  border-bottom: 1px solid var(--line, #e1e7ed);
+}
+
+.piece-quote-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 13.5px;
+  color: var(--ink, #1d3348);
+}
+
+.piece-quote-zone {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--blue, #2867d5);
+  background: #ffffff;
+  border: 1px solid #cfe0fa;
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+
+.piece-quote-subtotal {
+  text-align: right;
+  font-size: 11px;
+  color: var(--muted, #718295);
+}
+
+.piece-quote-subtotal b {
+  display: block;
+  font-size: 13.5px;
+  color: var(--ink, #1d3348);
+}
+
+.piece-interventions-list {
+  padding: 0 16px;
+}
+
+.piece-intervention-row {
+  display: grid;
+  grid-template-columns: minmax(125px, 1fr) minmax(115px, 140px) minmax(135px, 165px) minmax(110px, auto) 32px;
+  gap: 10px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--line, #e1e7ed);
+  align-items: end;
+}
+
+.piece-intervention-row:last-child {
+  border-bottom: 0;
+}
+
+.intervention-title {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-bottom: 6px;
+}
+
+.intervention-badge {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  padding: 4px 9px;
+  border-radius: 7px;
+  font-size: 11px;
+  font-weight: 800;
+  background: #eaf2ff;
+  color: var(--blue, #2867d5);
+}
+
+.intervention-badge.chapa {
+  background: #fff2e3;
+  color: #98581d;
+}
+
+.intervention-badge.pintura {
+  background: #eaf2ff;
+  color: var(--blue, #2867d5);
+}
+
+.intervention-badge.reemplazar,
+.intervention-badge.reparar {
+  background: #e9f6ef;
+  color: #147657;
+}
+
+.intervention-unit-hint {
+  font-size: 10px;
+  color: var(--muted, #718295);
+}
+
+.intervention-field {
+  font-size: 10.5px;
+  color: #5c7187;
+  font-weight: 700;
+}
+
+.intervention-field input {
+  font-size: 13px;
+  margin-top: 5px;
+}
+
+.intervention-subtotal {
+  text-align: right;
+  padding-bottom: 8px;
+  font-size: 10px;
+  color: var(--muted, #718295);
+}
+
+.intervention-subtotal b {
+  display: block;
+  font-size: 13px;
+  color: var(--ink, #1d3348);
+  margin-top: 3px;
+}
+
+.total-breakdown-row {
+  color: #4b637b;
+  border-bottom: 1px dashed #dce5f0;
+}
+
+@media (max-width: 680px) {
+  .piece-intervention-row {
+    grid-template-columns: 1fr 1fr 32px;
+    gap: 8px;
+  }
+  .intervention-title {
+    grid-column: 1 / -1;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    padding-bottom: 2px;
+  }
+  .intervention-subtotal {
+    grid-column: 1 / 3;
+    text-align: left;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding-bottom: 0;
+  }
+  .intervention-field input {
+    font-size: 16px;
+  }
+}

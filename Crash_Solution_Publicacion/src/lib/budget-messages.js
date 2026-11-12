@@ -1,4 +1,17 @@
 import { formatCuit } from './workshop-profile.js'
+import {
+  normalizeWorkIntervention,
+  describeQuoteLine,
+  syncBudgetFromInspection,
+  computeDetailedBudgetTotals
+} from './piece-budget.js'
+
+export {
+  normalizeWorkIntervention,
+  describeQuoteLine,
+  syncBudgetFromInspection,
+  computeDetailedBudgetTotals
+}
 
 const toSafeNumber = v => (Number.isFinite(Number(v)) ? Math.max(0, Number(v)) : 0)
 const toBounded = (v, min, max) => Math.min(max, Math.max(min, toSafeNumber(v)))
@@ -33,28 +46,11 @@ export function computeExpiryIsoDate(doc = {}) {
 }
 
 /**
- * Mantiene exactamente la misma fórmula de cálculo de presupuestos que `totals(j)` en index.html
+ * Mantiene exactamente la misma fórmula de cálculo de presupuestos que `totals(j)` en index.html,
+ * incorporando además el desglose separado de Chapa (días), Pintura (paños) y subtotales por pieza (DEV-35).
  */
 export function computeBudgetTotals(job = {}) {
-  const quoteLines = Array.isArray(job?.quote) ? job.quote : []
-  const subtotal = quoteLines.reduce(
-    (sum, line) => sum + toSafeNumber(line?.qty) * toSafeNumber(line?.price),
-    0
-  )
-  const discountPct = toBounded(job?.discount, 0, 100)
-  const taxPct = toBounded(job?.tax, 0, 100)
-  const discount = (subtotal * discountPct) / 100
-  const net = subtotal - discount
-  const tax = (net * taxPct) / 100
-  return {
-    subtotal,
-    discount,
-    discountPct,
-    net,
-    tax,
-    taxPct,
-    total: net + tax
-  }
+  return computeDetailedBudgetTotals(job)
 }
 
 export function validateBudgetForDelivery(job) {
@@ -110,6 +106,8 @@ export function buildBudgetFilename(job = {}) {
 /**
  * Construye el mensaje profesional de texto para WhatsApp (Opción A)
  * sin exponer enlaces públicos a presupuestos privados.
+ * En DEV-35 detalla nombre de la pieza, intervención, cantidad, unidad (días o paños),
+ * precio unitario, subtotal y resumen separado de Chapa y Pintura.
  */
 export function buildBudgetWhatsappMessage(job = {}, shop = {}) {
   const shopName = String(shop?.name || 'Crash Solution').trim()
@@ -148,6 +146,10 @@ export function buildBudgetWhatsappMessage(job = {}, shop = {}) {
 
   const linesText = (job?.quote || [])
     .map(q => {
+      const info = describeQuoteLine(q)
+      if (info.isInspectionPiece || q?.unit || q?.workType) {
+        return `- ${info.displayDescription} (${info.qty} ${info.unit} x ${formatArsCurrency(info.price)}): ${formatArsCurrency(info.subtotal)}`
+      }
       const qty = toSafeNumber(q.qty)
       const unitPrice = toSafeNumber(q.price)
       const lineTotal = qty * unitPrice
@@ -180,7 +182,16 @@ export function buildBudgetWhatsappMessage(job = {}, shop = {}) {
   ]
 
   const totalsLines = []
-  if (t.discount > 0 || t.tax > 0) {
+  if (t.chapaCount > 0 || t.chapaSubtotal > 0) {
+    totalsLines.push(`Resumen Chapa (${t.chapaDays} días): ${formatArsCurrency(t.chapaSubtotal)}`)
+  }
+  if (t.pinturaCount > 0 || t.pinturaSubtotal > 0) {
+    totalsLines.push(`Resumen Pintura (${t.pinturaPanels} paños): ${formatArsCurrency(t.pinturaSubtotal)}`)
+  }
+  if (t.otherSubtotal > 0 && (t.chapaCount > 0 || t.pinturaCount > 0)) {
+    totalsLines.push(`Otros trabajos / repuestos: ${formatArsCurrency(t.otherSubtotal)}`)
+  }
+  if (t.discount > 0 || t.tax > 0 || t.chapaCount > 0 || t.pinturaCount > 0) {
     totalsLines.push(`Subtotal: ${formatArsCurrency(t.subtotal)}`)
   }
   if (t.discount > 0) {

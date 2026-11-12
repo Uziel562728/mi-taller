@@ -34,6 +34,49 @@ export function isLowStock(item) {
   return Number.isFinite(qty) && Number.isFinite(min) && qty <= min
 }
 
+/**
+ * Devuelve únicamente los productos activos reales del taller indicado,
+ * excluyendo archivados, registros de otros talleres y duplicados por ID.
+ */
+export function getActiveStockItems(items = [], workshopId = null) {
+  if (!Array.isArray(items)) return []
+  const byId = new Map()
+  const withoutId = []
+
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue
+    if (workshopId && item.workshop_id && String(item.workshop_id) !== String(workshopId)) {
+      continue
+    }
+    if (item.id) {
+      byId.set(String(item.id), item)
+    } else {
+      withoutId.push(item)
+    }
+  }
+
+  return [...byId.values(), ...withoutId].filter(item => !item.archived_at)
+}
+
+export function countActiveStockItems(items = [], workshopId = null) {
+  return getActiveStockItems(items, workshopId).length
+}
+
+/**
+ * Formatea el precio de compra en formato argentino de pesos enteros sin centavos (ej. "$ 30.000").
+ */
+export function formatPurchasePriceArs(value) {
+  const num = Number(value ?? 0)
+  const safe = Number.isFinite(num) ? Math.round(num) : 0
+  const formatted = new Intl.NumberFormat('es-AR', {
+    maximumFractionDigits: 0,
+    minimumFractionDigits: 0
+  })
+    .format(safe)
+    .replace(/[\u00A0\u202F]/g, ' ')
+  return `$ ${formatted}`
+}
+
 export function validateStockItemInput(input = {}) {
   const name = String(input.name || '').trim()
   if (!name || name.length < 2) {
@@ -55,9 +98,22 @@ export function validateStockItemInput(input = {}) {
   const location = String(input.location || '').trim()
   const notes = String(input.notes || '').trim()
 
-  const purchasePrice = Number(input.purchase_price ?? 0)
-  if (!Number.isFinite(purchasePrice) || purchasePrice < 0) {
-    return { valid: false, error: 'El precio de compra debe ser un número mayor o igual a 0.' }
+  const rawPurchasePrice = input.purchase_price ?? 0
+  const rawPurchaseStr = String(rawPurchasePrice).trim()
+  const normalizedPurchaseStr = rawPurchaseStr.replace(',', '.')
+  const purchasePrice = rawPurchaseStr === '' ? 0 : Number(normalizedPurchaseStr)
+
+  if (!Number.isFinite(purchasePrice)) {
+    return { valid: false, error: 'El precio de compra debe ser un número entero en pesos mayor o igual a 0.' }
+  }
+  if (purchasePrice < 0) {
+    return { valid: false, error: 'El precio de compra no puede ser negativo. Ingresá un valor en pesos enteros mayor o igual a 0.' }
+  }
+  if (/[.,]/.test(rawPurchaseStr) || !Number.isInteger(purchasePrice)) {
+    return {
+      valid: false,
+      error: 'El precio de compra debe ingresarse en pesos enteros, sin centavos ni decimales (por ejemplo: 30000).'
+    }
   }
 
   const salePrice = Number(input.sale_price ?? 0)
@@ -85,7 +141,7 @@ export function validateStockItemInput(input = {}) {
       description: description || null,
       unit,
       location: location || null,
-      purchase_price: Math.round(purchasePrice * 100) / 100,
+      purchase_price: purchasePrice,
       // Omission in the simplified form must preserve the stored sale price on edits.
       ...(input.sale_price !== undefined ? { sale_price: Math.round(salePrice * 100) / 100 } : {}),
       minimum_quantity: Math.round(minimumQuantity * 100) / 100,
@@ -270,36 +326,49 @@ export function filterStockItems(items = [], filters = {}) {
   })
 }
 
-export async function fetchWorkshopStock(workshopId) {
+export async function fetchWorkshopStock(workshopId, { force = false } = {}) {
+  if (force) {
+    privateReadCache.invalidate(`stock:${workshopId}`)
+  }
   return privateReadCache.read(`stock:${workshopId}`, () => fetchStockUncached(workshopId), 20000)
 }
 
 async function fetchStockUncached(workshopId) {
   if (!supabase || !workshopId) return []
 
-  const [items, compatibilities] = await Promise.all([
-    fetchAllPages(() => supabase
+  const items = await fetchAllPages(() =>
+    supabase
       .from('stock_items')
       .select(
         'id, workshop_id, name, category, brand, sku, description, quantity, unit, location, purchase_price, sale_price, minimum_quantity, notes, archived_at, created_at'
       )
       .eq('workshop_id', workshopId)
-      .order('name', { ascending: true }).order('id', { ascending: true })),
-    fetchAllPages(() => supabase
-      .from('part_compatibility')
-      .select('id, stock_item_id, workshop_id, vehicle_make, vehicle_model, year_from, year_to, version, position')
-      .eq('workshop_id', workshopId).order('id', { ascending: true }))
-  ])
+      .order('name', { ascending: true })
+      .order('id', { ascending: true })
+  )
+
+  let compatibilities = []
+  try {
+    compatibilities = await fetchAllPages(() =>
+      supabase
+        .from('part_compatibility')
+        .select('id, stock_item_id, workshop_id, vehicle_make, vehicle_model, year_from, year_to, version, position')
+        .eq('workshop_id', workshopId)
+        .order('id', { ascending: true })
+    )
+  } catch {
+    compatibilities = []
+  }
 
   const compatByItem = new Map()
-  for (const c of compatibilities) {
+  for (const c of compatibilities || []) {
     if (!compatByItem.has(c.stock_item_id)) {
       compatByItem.set(c.stock_item_id, [])
     }
     compatByItem.get(c.stock_item_id).push(c)
   }
 
-  return items.map(item => ({
+  return (items || []).map(item => ({
     ...item,
     quantity: Number(item.quantity ?? 0),
     purchase_price: Number(item.purchase_price ?? 0),
@@ -316,17 +385,20 @@ export async function recordStockMovement({ itemId, currentQuantity = 0, quantit
   const check = validateStockMovementInput({ itemId, currentQuantity, quantityChange, reason })
   if (!check.valid) throw new Error(check.error)
 
-  // DEV-22: Para modificar cantidades se utiliza EXCLUSIVAMENTE la función RPC record_stock_movement
-  const { data, error } = await supabase.rpc('record_stock_movement', {
-    p_item_id: itemId,
-    p_quantity: check.delta,
-    p_reason: check.reason
-  })
+  try {
+    // DEV-22: Para modificar cantidades se utiliza EXCLUSIVAMENTE la función RPC record_stock_movement
+    const { data, error } = await supabase.rpc('record_stock_movement', {
+      p_item_id: itemId,
+      p_quantity: check.delta,
+      p_reason: check.reason
+    })
 
-  if (error) throw error
-  privateReadCache.invalidate('stock:')
-  privateReadCache.invalidate('movements:')
-  return data
+    if (error) throw error
+    return data
+  } finally {
+    privateReadCache.invalidate('stock:')
+    privateReadCache.invalidate('movements:')
+  }
 }
 
 export async function createStockItem(workshopId, input, compatibilities = []) {
@@ -340,44 +412,54 @@ export async function createStockItem(workshopId, input, compatibilities = []) {
   const compatCheck = validateCompatibilityEntries(compatibilities)
   if (!compatCheck.valid) throw new Error(compatCheck.error)
 
-  // Se inserta con quantity: 0 y si hay cantidad inicial > 0 se registra mediante record_stock_movement
-  const { data: created, error: insertErr } = await supabase
-    .from('stock_items')
-    .insert({
-      workshop_id: workshopId,
-      ...itemCheck.values,
-      sale_price: itemCheck.values.sale_price ?? 0,
-      quantity: 0
-    })
-    .select(
-      'id, workshop_id, name, category, brand, sku, description, quantity, unit, location, purchase_price, sale_price, minimum_quantity, notes, archived_at, created_at'
-    )
-    .single()
+  try {
+    // Se inserta con quantity: 0 y si hay cantidad inicial > 0 se registra mediante record_stock_movement
+    const { data: created, error: insertErr } = await supabase
+      .from('stock_items')
+      .insert({
+        workshop_id: workshopId,
+        ...itemCheck.values,
+        sale_price: itemCheck.values.sale_price ?? 0,
+        quantity: 0
+      })
+      .select(
+        'id, workshop_id, name, category, brand, sku, description, quantity, unit, location, purchase_price, sale_price, minimum_quantity, notes, archived_at, created_at'
+      )
+      .single()
 
-  if (insertErr) throw insertErr
+    if (insertErr) throw insertErr
 
-  if (compatCheck.entries.length > 0) {
-    const compatRows = compatCheck.entries.map(c => ({
-      ...c,
-      stock_item_id: created.id,
-      workshop_id: workshopId
-    }))
-    const { error: compatErr } = await supabase.from('part_compatibility').insert(compatRows)
-    if (compatErr) throw compatErr
+    if (compatCheck.entries.length > 0) {
+      const compatRows = compatCheck.entries.map(c => ({
+        ...c,
+        stock_item_id: created.id,
+        workshop_id: workshopId
+      }))
+      const { error: compatErr } = await supabase.from('part_compatibility').insert(compatRows)
+      if (compatErr) throw compatErr
+    }
+
+    let finalQty = Number(created?.quantity ?? 0)
+    if (itemCheck.initialQuantity > 0) {
+      await recordStockMovement({
+        itemId: created.id,
+        currentQuantity: 0,
+        quantityChange: itemCheck.initialQuantity,
+        reason: String(input.initial_reason || 'Stock inicial en alta de producto').trim()
+      })
+      finalQty = itemCheck.initialQuantity
+    }
+
+    return {
+      ...created,
+      quantity: finalQty,
+      archived_at: created?.archived_at ?? null,
+      compatibilities: compatCheck.entries
+    }
+  } finally {
+    privateReadCache.invalidate('stock:')
+    privateReadCache.invalidate('movements:')
   }
-
-  if (itemCheck.initialQuantity > 0) {
-    await recordStockMovement({
-      itemId: created.id,
-      currentQuantity: 0,
-      quantityChange: itemCheck.initialQuantity,
-      reason: String(input.initial_reason || 'Stock inicial en alta de producto').trim()
-    })
-  }
-
-  privateReadCache.invalidate('stock:')
-  privateReadCache.invalidate('movements:')
-  return created
 }
 
 export async function updateStockItem(workshopId, itemId, input, compatibilities = []) {
@@ -392,40 +474,46 @@ export async function updateStockItem(workshopId, itemId, input, compatibilities
   const compatCheck = validateCompatibilityEntries(compatibilities)
   if (!compatCheck.valid) throw new Error(compatCheck.error)
 
-  // Nunca actualiza quantity directamente; la cantidad solo se modifica vía record_stock_movement
-  const { data: updated, error: updateErr } = await supabase
-    .from('stock_items')
-    .update(itemCheck.values)
-    .eq('id', itemId)
-    .eq('workshop_id', workshopId)
-    .select(
-      'id, workshop_id, name, category, brand, sku, description, quantity, unit, location, purchase_price, sale_price, minimum_quantity, notes, archived_at, created_at'
-    )
-    .single()
+  try {
+    // Nunca actualiza quantity directamente; la cantidad solo se modifica vía record_stock_movement
+    const { data: updated, error: updateErr } = await supabase
+      .from('stock_items')
+      .update(itemCheck.values)
+      .eq('id', itemId)
+      .eq('workshop_id', workshopId)
+      .select(
+        'id, workshop_id, name, category, brand, sku, description, quantity, unit, location, purchase_price, sale_price, minimum_quantity, notes, archived_at, created_at'
+      )
+      .single()
 
-  if (updateErr) throw updateErr
+    if (updateErr) throw updateErr
 
-  // Reemplazar filas de compatibilidad para este producto
-  const { error: delCompatErr } = await supabase
-    .from('part_compatibility')
-    .delete()
-    .eq('stock_item_id', itemId)
-    .eq('workshop_id', workshopId)
+    // Reemplazar filas de compatibilidad para este producto
+    const { error: delCompatErr } = await supabase
+      .from('part_compatibility')
+      .delete()
+      .eq('stock_item_id', itemId)
+      .eq('workshop_id', workshopId)
 
-  if (delCompatErr) throw delCompatErr
+    if (delCompatErr) throw delCompatErr
 
-  if (compatCheck.entries.length > 0) {
-    const compatRows = compatCheck.entries.map(c => ({
-      ...c,
-      stock_item_id: itemId,
-      workshop_id: workshopId
-    }))
-    const { error: insCompatErr } = await supabase.from('part_compatibility').insert(compatRows)
-    if (insCompatErr) throw insCompatErr
+    if (compatCheck.entries.length > 0) {
+      const compatRows = compatCheck.entries.map(c => ({
+        ...c,
+        stock_item_id: itemId,
+        workshop_id: workshopId
+      }))
+      const { error: insCompatErr } = await supabase.from('part_compatibility').insert(compatRows)
+      if (insCompatErr) throw insCompatErr
+    }
+
+    return {
+      ...updated,
+      compatibilities: compatCheck.entries
+    }
+  } finally {
+    privateReadCache.invalidate('stock:')
   }
-
-  privateReadCache.invalidate('stock:')
-  return updated
 }
 
 export async function archiveStockItem(workshopId, itemId, archive = true) {
@@ -434,23 +522,30 @@ export async function archiveStockItem(workshopId, itemId, archive = true) {
     throw new Error('Seleccioná un producto válido.')
   }
 
-  const { data, error } = await supabase
-    .from('stock_items')
-    .update({
-      archived_at: archive ? new Date().toISOString() : null
-    })
-    .eq('id', itemId)
-    .eq('workshop_id', workshopId)
-    .select('id, archived_at')
-    .single()
+  try {
+    const { data, error } = await supabase
+      .from('stock_items')
+      .update({
+        archived_at: archive ? new Date().toISOString() : null
+      })
+      .eq('id', itemId)
+      .eq('workshop_id', workshopId)
+      .select('id, archived_at')
+      .single()
 
-  if (error) throw error
-  privateReadCache.invalidate('stock:')
-  return data
+    if (error) throw error
+    return data
+  } finally {
+    privateReadCache.invalidate('stock:')
+  }
 }
 
-export async function fetchStockMovements(workshopId, itemId = null, limit = 60) {
-  return privateReadCache.read(`movements:${workshopId}:${itemId || 'all'}:${limit}`, () => fetchMovementsUncached(workshopId, itemId, limit), 20000)
+export async function fetchStockMovements(workshopId, itemId = null, limit = 60, { force = false } = {}) {
+  const key = `movements:${workshopId}:${itemId || 'all'}:${limit}`
+  if (force) {
+    privateReadCache.invalidate(key)
+  }
+  return privateReadCache.read(key, () => fetchMovementsUncached(workshopId, itemId, limit), 20000)
 }
 
 async function fetchMovementsUncached(workshopId, itemId, limit) {

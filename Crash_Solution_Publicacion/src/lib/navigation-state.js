@@ -1,6 +1,6 @@
 const NAV_STORAGE_KEY = 'mitaller_nav_state_v1'
 
-const VALID_SCREENS = ['jobs', 'work', 'stock', 'profile', 'admin']
+const VALID_SCREENS = ['jobs', 'work', 'stock', 'profile', 'admin', 'settings']
 const VALID_STEPS = ['reception', 'inspection', 'budget']
 
 export function buildNavigationSnapshot({

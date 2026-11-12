@@ -67,7 +67,7 @@ describe('Stock: precio de compra y conservación de datos', () => {
     expect(document.querySelector('.stock-summary-stats').children).toHaveLength(2)
     const card = document.querySelector('.stock-card')
     expect(card.textContent).toContain('Precio de compra')
-    expect(card.textContent).toContain('1.200,5')
+    expect(card.textContent).toContain('$ 1.201')
     expect(card.textContent).not.toContain('98.765')
     expect(card.textContent).toContain('2 lt')
     expect(card.textContent).toContain('Estante B')
@@ -77,13 +77,13 @@ describe('Stock: precio de compra y conservación de datos', () => {
 
   it('crea y vuelve a consultar un producto con compra y cantidad inicial mediante RPC', async () => {
     await renderStockScreen()
-    set('stName', 'Pintura nueva'); set('stPurchasePrice', '2300.75'); set('stInitialQty', '4')
+    set('stName', 'Pintura nueva'); set('stPurchasePrice', '2300'); set('stInitialQty', '4')
     submit()
     await vi.waitFor(() => expect(document.getElementById('stockAlertBox').textContent).toContain('dado de alta'))
-    expect(rows.find(item => item.id === 'item-new')).toMatchObject({ purchase_price: 2300.75, quantity: 4, sale_price: 0 })
+    expect(rows.find(item => item.id === 'item-new')).toMatchObject({ purchase_price: 2300, quantity: 4, sale_price: 0 })
     expect(backend.rpc).toHaveBeenCalledWith('record_stock_movement', expect.objectContaining({ p_item_id: 'item-new', p_quantity: 4 }))
     await renderStockScreen()
-    expect(document.getElementById('stockItemsGrid').textContent).toContain('2.300,75')
+    expect(document.getElementById('stockItemsGrid').textContent).toContain('$ 2.300')
   })
 
   it('edita y consulta compra sin sobrescribir venta ni cantidades existentes', async () => {
@@ -91,12 +91,12 @@ describe('Stock: precio de compra y conservación de datos', () => {
     document.querySelector('[data-edit-item="item-1"]').click()
     await vi.waitFor(() => expect(document.getElementById('stName').value).toBe('Barniz'))
     expect(document.getElementById('stPurchasePrice').value).toBe('1200.5')
-    set('stPurchasePrice', '1400.25'); submit()
+    set('stPurchasePrice', '1400'); submit()
     await vi.waitFor(() => expect(document.getElementById('stockAlertBox').textContent).toContain('actualizados'))
     expect(writes[0].values).not.toHaveProperty('sale_price')
     expect(writes[0].values).not.toHaveProperty('quantity')
-    expect(rows[0]).toMatchObject({ purchase_price: 1400.25, sale_price: 98765, quantity: 2 })
-    expect(document.querySelector('.stock-card').textContent).toContain('1.400,25')
+    expect(rows[0]).toMatchObject({ purchase_price: 1400, sale_price: 98765, quantity: 2 })
+    expect(document.querySelector('.stock-card').textContent).toContain('$ 1.400')
     expect(backend.rpc).not.toHaveBeenCalled()
   })
 

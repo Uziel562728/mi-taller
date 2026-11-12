@@ -1,14 +1,61 @@
 import { jsPDF } from 'jspdf'
 import { formatCuit } from './workshop-profile.js'
-import { formatArsCurrency, getVehicleYear, formatIsoDateAr, computeExpiryIsoDate, computeBudgetTotals, validateBudgetForDelivery, normalizeWhatsappPhone, buildBudgetFilename, buildBudgetWhatsappMessage, buildWhatsappShareUrl, openWhatsappWithBudgetText } from './budget-messages.js'
+import {
+  formatArsCurrency,
+  getVehicleYear,
+  formatIsoDateAr,
+  computeExpiryIsoDate,
+  computeBudgetTotals,
+  describeQuoteLine,
+  validateBudgetForDelivery,
+  normalizeWhatsappPhone,
+  buildBudgetFilename,
+  buildBudgetWhatsappMessage,
+  buildWhatsappShareUrl,
+  openWhatsappWithBudgetText
+} from './budget-messages.js'
 export * from './budget-messages.js'
+
 const toSafeNumber = v => (Number.isFinite(Number(v)) ? Math.max(0, Number(v)) : 0)
+
 function detectImageFormatFromDataUrl(dataUrl) {
   const str = String(dataUrl || '')
   if (str.startsWith('data:image/png')) return 'PNG'
   if (str.startsWith('data:image/jpeg') || str.startsWith('data:image/jpg')) return 'JPEG'
   if (str.startsWith('data:image/webp')) return 'WEBP'
   return null
+}
+
+/**
+ * Normaliza cadenas para fuentes PDF estándar (Helvetica WinAnsiEncoding),
+ * reemplazando signos matemáticos fuera de Latin-1 (ej. U+2212) y espacios NBSP.
+ */
+function sanitizePdfText(value) {
+  return String(value ?? '')
+    .replace(/[\u00A0\u202F\t]+/g, ' ')
+    .replace(/\u2212/g, '-')
+    .replace(/\uFFFD/g, '')
+    .normalize('NFC')
+}
+
+/**
+ * Verifica que los bytes correspondan a un documento PDF válido (%PDF-1.x).
+ */
+export function verifyPdfBytesIntegrity(bytes) {
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength < 100) {
+    return { valid: false, error: 'El documento PDF es inválido o está vacío.' }
+  }
+  // Cabecera estándar "%PDF-" (0x25, 0x50, 0x44, 0x46, 0x2D)
+  const hasPdfHeader =
+    bytes[0] === 0x25 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x44 &&
+    bytes[3] === 0x46 &&
+    bytes[4] === 0x2d
+  if (!hasPdfHeader) {
+    return { valid: false, error: 'El documento generado no posee cabecera PDF válida.' }
+  }
+  return { valid: true, byteLength: bytes.byteLength }
 }
 
 /**
@@ -33,12 +80,12 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
   const contentWidth = pageWidth - margin * 2
   let y = margin
 
-  const shopName = String(shop?.name || 'Crash Solution').trim()
-  const legalName = String(shop?.legal_name || '').trim()
+  const shopName = sanitizePdfText(shop?.name || 'Crash Solution').trim() || 'Crash Solution'
+  const legalName = sanitizePdfText(shop?.legal_name || '').trim()
   const cuit = shop?.tax_id ? formatCuit(shop.tax_id) : ''
   const quoteRef = String(job?.number || '').startsWith('LOCAL-')
     ? `Referencia ${String(job?.id || '').slice(0, 8).toUpperCase()}`
-    : String(job?.number || 'OT-0001')
+    : sanitizePdfText(job?.number || 'OT-0001')
   const d = job?.document || {}
   const issueDate = formatIsoDateAr(d.date)
   const validUntil = formatIsoDateAr(computeExpiryIsoDate(d))
@@ -76,12 +123,12 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
     leftY += 4.5
   }
   if (shop?.address) {
-    doc.text(String(shop.address), textStartX, leftY)
+    doc.text(sanitizePdfText(shop.address), textStartX, leftY)
     leftY += 4.5
   }
   const phonesLine = [
-    shop?.phone ? `Tel: ${shop.phone}` : '',
-    shop?.whatsapp ? `WhatsApp: ${shop.whatsapp}` : ''
+    shop?.phone ? `Tel: ${sanitizePdfText(shop.phone)}` : '',
+    shop?.whatsapp ? `WhatsApp: ${sanitizePdfText(shop.whatsapp)}` : ''
   ]
     .filter(Boolean)
     .join(' · ')
@@ -90,7 +137,7 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
     leftY += 4.5
   }
   if (shop?.email) {
-    doc.text(`Email: ${shop.email}`, textStartX, leftY)
+    doc.text(`Email: ${sanitizePdfText(shop.email)}`, textStartX, leftY)
     leftY += 4.5
   }
 
@@ -110,7 +157,7 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
   doc.text(`Fecha de emisión: ${issueDate}`, rightX, y + 16.5, { align: 'right' })
   doc.text(`Válido hasta: ${validUntil}`, rightX, y + 21, { align: 'right' })
   if (job?.status) {
-    doc.text(`Estado: ${job.status}`, rightX, y + 25.5, { align: 'right' })
+    doc.text(`Estado: ${sanitizePdfText(job.status)}`, rightX, y + 25.5, { align: 'right' })
   }
 
   y = Math.max(leftY, y + 28) + 3
@@ -138,17 +185,20 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
   doc.setFont('helvetica', 'bold')
   doc.setFontSize(10.5)
   doc.setTextColor(19, 44, 67)
-  doc.text(String(job?.rec?.cliente || 'Sin especificar').slice(0, 48), margin + 4, y + 11)
+  doc.text(sanitizePdfText(job?.rec?.cliente || 'Sin especificar').slice(0, 48), margin + 4, y + 11)
 
   doc.setFont('helvetica', 'normal')
   doc.setFontSize(8.8)
   doc.setTextColor(65, 84, 104)
   let clientY = y + 16
   if (job?.rec?.telefono) {
-    doc.text(`WhatsApp / Tel: ${job.rec.telefono}`, margin + 4, clientY)
+    doc.text(`WhatsApp / Tel: ${sanitizePdfText(job.rec.telefono)}`, margin + 4, clientY)
     clientY += 4.8
   }
-  const clientAddress = [job?.rec?.direccion, job?.rec?.localidad].filter(Boolean).join(', ')
+  const clientAddress = [job?.rec?.direccion, job?.rec?.localidad]
+    .map(v => sanitizePdfText(v).trim())
+    .filter(Boolean)
+    .join(', ')
   if (clientAddress) {
     doc.text(clientAddress.slice(0, 52), margin + 4, clientY)
   }
@@ -160,10 +210,10 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
   doc.setTextColor(113, 130, 149)
   doc.text('VEHÍCULO', vehX, y + 5.5)
 
-  const plateText = String(job?.rec?.patente || '').trim().toUpperCase()
-  const yearText = getVehicleYear(job?.rec)
+  const plateText = sanitizePdfText(job?.rec?.patente || '').trim().toUpperCase()
+  const yearText = sanitizePdfText(getVehicleYear(job?.rec))
   const makeModelOnly = [job?.rec?.marca, job?.rec?.modelo]
-    .map(v => String(v || '').trim())
+    .map(v => sanitizePdfText(v || '').trim())
     .filter(Boolean)
     .join(' ')
 
@@ -195,11 +245,11 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
     vehY += 4.6
   }
   if (job?.rec?.km) {
-    doc.text(`Kilometraje: ${String(job.rec.km).trim()} km`, vehX, vehY)
+    doc.text(`Kilometraje: ${sanitizePdfText(job.rec.km).trim()} km`, vehX, vehY)
     vehY += 4.6
   }
   if (job?.rec?.motivo) {
-    doc.text(`Ingreso: ${String(job.rec.motivo).slice(0, 48)}`, vehX, vehY)
+    doc.text(`Ingreso: ${sanitizePdfText(job.rec.motivo).slice(0, 48)}`, vehX, vehY)
   }
 
   y += boxHeight + 7
@@ -212,10 +262,10 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
     doc.setFont('helvetica', 'bold')
     doc.setFontSize(8.5)
     doc.setTextColor(40, 70, 110)
-    doc.text('TRABAJO O REPUESTO', margin + 3, currentY + 5.3)
-    doc.text('CANT.', margin + 108, currentY + 5.3, { align: 'right' })
-    doc.text('PRECIO UNIT.', margin + 142, currentY + 5.3, { align: 'right' })
-    doc.text('IMPORTE', pageWidth - margin - 3, currentY + 5.3, { align: 'right' })
+    doc.text('PIEZA / INTERVENCIÓN', margin + 3, currentY + 5.3)
+    doc.text('CANT. / UNID.', margin + 112, currentY + 5.3, { align: 'right' })
+    doc.text('PRECIO UNIT.', margin + 145, currentY + 5.3, { align: 'right' })
+    doc.text('SUBTOTAL', pageWidth - margin - 3, currentY + 5.3, { align: 'right' })
     return currentY + 8
   }
 
@@ -226,7 +276,9 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
   doc.setTextColor(29, 51, 72)
 
   for (const line of job.quote || []) {
-    const descLines = doc.splitTextToSize(String(line.description || ''), 92)
+    const info = describeQuoteLine(line)
+    const descText = sanitizePdfText(info.displayDescription || line.description || '')
+    const descLines = doc.splitTextToSize(descText, 88)
     const rowHeight = Math.max(8, descLines.length * 4.6 + 3.4)
 
     if (y + rowHeight > pageHeight - 55) {
@@ -238,15 +290,16 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
       doc.setTextColor(29, 51, 72)
     }
 
-    const qty = toSafeNumber(line.qty)
-    const price = toSafeNumber(line.price)
-    const lineSubtotal = qty * price
+    const qtyDisplay =
+      info.isInspectionPiece || line?.unit || line?.workType
+        ? sanitizePdfText(`${info.qty} ${info.unit}`)
+        : String(info.qty)
 
     doc.text(descLines, margin + 3, y + 5.2)
-    doc.text(String(qty), margin + 108, y + 5.2, { align: 'right' })
-    doc.text(formatArsCurrency(price), margin + 142, y + 5.2, { align: 'right' })
+    doc.text(qtyDisplay, margin + 112, y + 5.2, { align: 'right' })
+    doc.text(formatArsCurrency(info.price), margin + 145, y + 5.2, { align: 'right' })
     doc.setFont('helvetica', 'bold')
-    doc.text(formatArsCurrency(lineSubtotal), pageWidth - margin - 3, y + 5.2, { align: 'right' })
+    doc.text(formatArsCurrency(info.subtotal), pageWidth - margin - 3, y + 5.2, { align: 'right' })
     doc.setFont('helvetica', 'normal')
 
     doc.setDrawColor(225, 231, 237)
@@ -257,20 +310,51 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
 
   y += 5
 
-  // 4. Cuadro de Totales
+  // 4. Cuadro de Totales (con resumen separado de Chapa y Pintura además del total general)
   const t = computeBudgetTotals(job)
-  if (y + 38 > pageHeight - 25) {
+  const extraSummaryRows =
+    (t.chapaCount > 0 || t.chapaSubtotal > 0 ? 1 : 0) +
+    (t.pinturaCount > 0 || t.pinturaSubtotal > 0 ? 1 : 0) +
+    (t.otherSubtotal > 0 && (t.chapaCount > 0 || t.pinturaCount > 0) ? 1 : 0)
+  if (y + 38 + extraSummaryRows * 6 > pageHeight - 25) {
     doc.addPage()
     y = margin
   }
 
-  const totalsBoxWidth = 82
+  const totalsBoxWidth = 92
   const totalsBoxX = pageWidth - margin - totalsBoxWidth
   let totalsY = y
 
   doc.setFont('helvetica', 'normal')
-  doc.setFontSize(9.5)
+  doc.setFontSize(9.2)
   doc.setTextColor(65, 84, 104)
+
+  if (t.chapaCount > 0 || t.chapaSubtotal > 0) {
+    doc.setFont('helvetica', 'normal')
+    doc.text(sanitizePdfText(`Resumen Chapa (${t.chapaDays} días):`), totalsBoxX, totalsY + 5)
+    doc.setFont('helvetica', 'bold')
+    doc.text(formatArsCurrency(t.chapaSubtotal), pageWidth - margin, totalsY + 5, { align: 'right' })
+    totalsY += 6
+  }
+
+  if (t.pinturaCount > 0 || t.pinturaSubtotal > 0) {
+    doc.setFont('helvetica', 'normal')
+    doc.text(sanitizePdfText(`Resumen Pintura (${t.pinturaPanels} paños):`), totalsBoxX, totalsY + 5)
+    doc.setFont('helvetica', 'bold')
+    doc.text(formatArsCurrency(t.pinturaSubtotal), pageWidth - margin, totalsY + 5, { align: 'right' })
+    totalsY += 6
+  }
+
+  if (t.otherSubtotal > 0 && (t.chapaCount > 0 || t.pinturaCount > 0)) {
+    doc.setFont('helvetica', 'normal')
+    doc.text('Otros trabajos / repuestos:', totalsBoxX, totalsY + 5)
+    doc.setFont('helvetica', 'bold')
+    doc.text(formatArsCurrency(t.otherSubtotal), pageWidth - margin, totalsY + 5, { align: 'right' })
+    totalsY += 6
+  }
+
+  doc.setFont('helvetica', 'normal')
+  doc.setFontSize(9.5)
   doc.text('Subtotal:', totalsBoxX, totalsY + 5)
   doc.setFont('helvetica', 'bold')
   doc.text(formatArsCurrency(t.subtotal), pageWidth - margin, totalsY + 5, { align: 'right' })
@@ -280,7 +364,7 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
     doc.setFont('helvetica', 'normal')
     doc.text(`Descuento (${t.discountPct}%):`, totalsBoxX, totalsY + 5)
     doc.setFont('helvetica', 'bold')
-    doc.text(`− ${formatArsCurrency(t.discount)}`, pageWidth - margin, totalsY + 5, { align: 'right' })
+    doc.text(`- ${formatArsCurrency(t.discount)}`, pageWidth - margin, totalsY + 5, { align: 'right' })
     totalsY += 6
   }
 
@@ -307,7 +391,7 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
 
   // 5. Condiciones y Observaciones
   if (d.terms && String(d.terms).trim()) {
-    const termsLines = doc.splitTextToSize(String(d.terms).trim(), contentWidth - 6)
+    const termsLines = doc.splitTextToSize(sanitizePdfText(d.terms).trim(), contentWidth - 6)
     const termsHeight = termsLines.length * 4.5 + 10
     if (y + termsHeight > pageHeight - 22) {
       doc.addPage()
@@ -340,10 +424,10 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
     shopName,
     legalName,
     cuit ? `CUIT ${cuit}` : '',
-    shop?.address,
-    shop?.phone ? `Tel: ${shop.phone}` : '',
-    shop?.whatsapp ? `WhatsApp: ${shop.whatsapp}` : '',
-    shop?.email
+    shop?.address ? sanitizePdfText(shop.address) : '',
+    shop?.phone ? `Tel: ${sanitizePdfText(shop.phone)}` : '',
+    shop?.whatsapp ? `WhatsApp: ${sanitizePdfText(shop.whatsapp)}` : '',
+    shop?.email ? sanitizePdfText(shop.email) : ''
   ]
     .filter(Boolean)
     .join(' · ')
@@ -360,7 +444,12 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
 export function generateBudgetPdfBytes(job = {}, shop = {}) {
   const doc = createBudgetJsPdfDocument(job, shop)
   const arrayBuffer = doc.output('arraybuffer')
-  return new Uint8Array(arrayBuffer)
+  const bytes = new Uint8Array(arrayBuffer)
+  const integrity = verifyPdfBytesIntegrity(bytes)
+  if (!integrity.valid) {
+    throw new Error(integrity.error || 'No se pudo verificar la integridad del documento PDF generado.')
+  }
+  return bytes
 }
 
 export function generateBudgetPdfBlob(job = {}, shop = {}) {
@@ -374,27 +463,62 @@ export function generateBudgetPdfFile(job = {}, shop = {}) {
   return new File([blob], filename, { type: 'application/pdf' })
 }
 
+/**
+ * Descarga de forma confiable el presupuesto PDF en Chrome (escritorio y móvil) y Android PWA.
+ * Conserva el enlace en el DOM durante la activación del gestor de descargas del sistema
+ * y difiere la revocación del ObjectURL para evitar descargas truncadas o canceladas en Android.
+ */
 export function downloadBudgetPdf(job = {}, shop = {}, docObj = globalThis.document) {
   const blob = generateBudgetPdfBlob(job, shop)
   const filename = buildBudgetFilename(job)
 
-  if (docObj?.createElement && typeof URL !== 'undefined' && URL.createObjectURL) {
+  if (!blob || blob.size <= 0) {
+    throw new Error('El archivo PDF generado está vacío. Revisá los datos del presupuesto.')
+  }
+
+  let triggered = false
+  if (docObj?.createElement && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
     const url = URL.createObjectURL(blob)
     const anchor = docObj.createElement('a')
     anchor.href = url
     anchor.download = filename
     anchor.rel = 'noopener'
-    docObj.body?.appendChild(anchor)
+    anchor.target = '_self'
+    if (anchor.style) {
+      anchor.style.display = 'none'
+    }
+    const container = docObj.body || docObj.documentElement
+    container?.appendChild?.(anchor)
     anchor.click()
-    anchor.remove?.()
-    setTimeout(() => URL.revokeObjectURL(url), 1500)
+    triggered = true
+
+    const removeTimer = setTimeout(() => {
+      try {
+        anchor.remove?.()
+      } catch {
+        // Ignorar si el nodo ya fue removido
+      }
+    }, 300)
+    removeTimer?.unref?.()
+
+    const revokeTimer = setTimeout(() => {
+      try {
+        URL.revokeObjectURL?.(url)
+      } catch {
+        // Ignorar error al revocar URL
+      }
+    }, 30000)
+    revokeTimer?.unref?.()
   }
 
   return {
     downloaded: true,
+    triggered,
+    sentConfirmed: false,
     filename,
     size: blob.size,
-    userMessage: `PDF "${filename}" generado y descargado correctamente.`
+    byteLength: blob.size,
+    userMessage: `PDF generado y descargado correctamente ("${filename}").`
   }
 }
 
@@ -420,9 +544,15 @@ export async function shareBudgetPdf(
     typeof navigatorObj.canShare === 'function' &&
     typeof navigatorObj.share === 'function'
   ) {
+    let canShareFiles = false
     try {
-      const canShareFiles = navigatorObj.canShare({ files: [pdfFile] })
-      if (canShareFiles) {
+      canShareFiles = Boolean(navigatorObj.canShare({ files: [pdfFile] }))
+    } catch {
+      canShareFiles = false
+    }
+
+    if (canShareFiles) {
+      try {
         await navigatorObj.share({
           files: [pdfFile],
           title: shareTitle,
@@ -434,15 +564,18 @@ export async function shareBudgetPdf(
           sentConfirmed: false,
           userMessage: `Menú de compartir completado para "${pdfFile.name}". Verificá la entrega en la aplicación elegida.`
         }
-      }
-    } catch (err) {
-      if (err?.name === 'AbortError') {
-        return {
-          mode: 'cancelled',
-          filename: pdfFile.name,
-          sentConfirmed: false,
-          userMessage: 'Se canceló el menú para compartir el PDF.'
+      } catch (err) {
+        if (err?.name === 'AbortError') {
+          return {
+            mode: 'cancelled',
+            filename: pdfFile.name,
+            sentConfirmed: false,
+            userMessage: 'Se canceló el menú para compartir el PDF.'
+          }
         }
+        throw new Error(
+          `No se pudo compartir el archivo PDF "${pdfFile.name}" directamente desde este navegador. Usá «Descargar / Imprimir» para guardar el PDF y adjuntalo manualmente.`
+        )
       }
     }
   }

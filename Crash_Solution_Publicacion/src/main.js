@@ -41,8 +41,12 @@ import {
   STOCK_UNITS,
   PART_POSITIONS,
   isLowStock,
+  formatPurchasePriceArs,
+  validateStockItemInput,
   formatCompatibilityLabel,
   filterStockItems,
+  getActiveStockItems,
+  countActiveStockItems,
   fetchWorkshopStock,
   createStockItem,
   updateStockItem,
@@ -50,7 +54,14 @@ import {
   recordStockMovement,
   fetchStockMovements
 } from './lib/stock.js'
+import {
+  DEFAULT_WORKSHOP_SETTINGS,
+  getSettingsSchema,
+  getWorkshopSettings,
+  saveWorkshopSettings
+} from './lib/settings.js'
 import { openWhatsappWithBudgetText } from './lib/budget-messages.js'
+import * as budgetDeliveryStaticModule from './lib/budget-delivery.js'
 import {
   saveOfflineJob,
   getOfflineJobsForScope,
@@ -71,6 +82,52 @@ import {
   clearNavigationState,
   shouldReinitializeOnAuthEvent
 } from './lib/navigation-state.js'
+import {
+  showErrorModal,
+  closeErrorModal,
+  isErrorModalOpen,
+  markFieldError,
+  clearFieldErrors,
+  showSuccessToast,
+  clearAllTransientErrors,
+  inferErrorDetails
+} from './lib/notifications.js'
+import {
+  normalizeWorkIntervention,
+  describeQuoteLine,
+  syncBudgetFromInspection,
+  computeDetailedBudgetTotals
+} from './lib/piece-budget.js'
+
+export {
+  showErrorModal,
+  closeErrorModal,
+  isErrorModalOpen,
+  markFieldError,
+  clearFieldErrors,
+  showSuccessToast,
+  clearAllTransientErrors,
+  inferErrorDetails,
+  normalizeWorkIntervention,
+  describeQuoteLine,
+  syncBudgetFromInspection,
+  computeDetailedBudgetTotals
+}
+
+if (typeof window !== 'undefined') {
+  Object.assign(window, {
+    showErrorModal,
+    closeErrorModal,
+    isErrorModalOpen,
+    markFieldError,
+    clearFieldErrors,
+    showSuccessToast,
+    normalizeWorkIntervention,
+    describeQuoteLine,
+    syncBudgetFromInspection,
+    computeDetailedBudgetTotals
+  })
+}
 
 const esc = s =>
   String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
@@ -108,7 +165,8 @@ export const appAuthState = {
   draftCompatibilities: [],
   stockVisibleCount: 40,
   stockRenderFilterKey: '',
-  movementTargetItem: null
+  movementTargetItem: null,
+  workshopSettings: { ...DEFAULT_WORKSHOP_SETTINGS }
 }
 
 function getActiveMembership() {
@@ -122,7 +180,7 @@ function getActiveMembership() {
 let appRouter = null
 let routeRenderingDepth = 0
 let routeInitializedFor = null
-let budgetDeliveryModule = null
+let budgetDeliveryModule = budgetDeliveryStaticModule
 let budgetDeliveryPromise = null
 let pendingSessionInitialization = null
 let jobsLoadPromise = null
@@ -130,20 +188,8 @@ let jobsLoadScope = null
 let lastHeaderMarkup = ''
 function prepareBudgetDelivery() {
   if (budgetDeliveryModule) return Promise.resolve(budgetDeliveryModule)
-  if (budgetDeliveryPromise) return budgetDeliveryPromise
-  const buttons = ['downloadBudgetPdfBtn', 'shareBudgetPdfBtn'].map(id => document.getElementById(id)).filter(Boolean)
-  buttons.forEach(button => { button.disabled = true; button.setAttribute('aria-busy', 'true') })
-  budgetDeliveryPromise = import('./lib/budget-delivery.js').then(module => {
-    budgetDeliveryModule = module
-    return module
-  }).catch(error => {
-    setBudgetDeliveryFeedback('error', 'No se pudo preparar el PDF. Revisá tu conexión y volvé a intentar.')
-    throw error
-  }).finally(() => {
-    budgetDeliveryPromise = null
-    buttons.forEach(button => { button.disabled = false; button.removeAttribute('aria-busy') })
-  })
-  return budgetDeliveryPromise
+  budgetDeliveryModule = budgetDeliveryStaticModule
+  return Promise.resolve(budgetDeliveryModule)
 }
 let initialRecoveryRequested = isPasswordSetupCallback(window.location)
 const routeScope = () => `${appAuthState.user?.id || 'anonymous'}:${getActiveMembership()?.workshop_id || '-'}`
@@ -161,7 +207,7 @@ function clearWorkshopReadState() {
   appAuthState.editingStockItem = null
   appAuthState.movementTargetItem = null
   appAuthState.draftCompatibilities = []
-  for (const id of ['profileScreen', 'stockScreen', 'adminScreen']) document.getElementById(id)?.replaceChildren()
+  for (const id of ['profileScreen', 'stockScreen', 'adminScreen', 'settingsScreen']) document.getElementById(id)?.replaceChildren()
 }
 const duringRouteRender = callback => {
   routeRenderingDepth++
@@ -187,6 +233,24 @@ export function navigateAppRoute(route, options = {}) {
   return getAppRouter().navigate(route, options)
 }
 
+export function goBackAppRoute(fallbackRoute = { name: 'jobs' }) {
+  return getAppRouter().goBack(fallbackRoute)
+}
+
+function ensureSettingsScreenElement() {
+  let el = document.getElementById('settingsScreen')
+  if (!el) {
+    const main = document.getElementById('mainAppContainer')
+    if (main) {
+      el = document.createElement('section')
+      el.id = 'settingsScreen'
+      el.hidden = true
+      main.append(el)
+    }
+  }
+  return el
+}
+
 function hidePasswordScreen() {
   appAuthState.authMode = 'login'
   const authScreen = document.getElementById('authScreen')
@@ -202,6 +266,7 @@ export function clearScreenNotices() {
     element.replaceChildren()
     delete element.dataset.validation
   }
+  clearAllTransientErrors()
 }
 
 async function renderAppRoute(route, entry) {
@@ -218,10 +283,11 @@ async function renderAppRoute(route, entry) {
     return
   }
   hidePasswordScreen()
+  ensureSettingsScreenElement()
   if (['stock', 'profile'].includes(route.name) && !getActiveMembership()) {
     return getAppRouter().navigate({ name: 'admin' }, { replace: true })
   }
-  const screens = { jobs: 'jobsScreen', work: 'workScreen', stock: 'stockScreen', profile: 'profileScreen', admin: 'adminScreen' }
+  const screens = { jobs: 'jobsScreen', work: 'workScreen', stock: 'stockScreen', profile: 'profileScreen', admin: 'adminScreen', settings: 'settingsScreen' }
   for (const [name, id] of Object.entries(screens)) {
     const element = document.getElementById(id)
     if (element) element.hidden = name !== route.name
@@ -243,6 +309,7 @@ async function renderAppRoute(route, entry) {
   }
   if (route.name === 'admin') return loadSection(() => openAdminScreen({ fromRoute: true }))
   if (route.name === 'profile') return loadSection(() => openProfileScreen({ fromRoute: true }))
+  if (route.name === 'settings') return loadSection(() => openSettingsScreen({ fromRoute: true }))
   if (route.name === 'stock') {
     if (entry.snapshot?.stockListLimit) {
       appAuthState.stockVisibleCount = entry.snapshot.stockListLimit
@@ -273,54 +340,112 @@ async function renderAppRoute(route, entry) {
 
 function setAuthAlert(type, message) {
   const box = document.getElementById('authAlertBox')
-  if (!box) return
   if (!message) {
-    box.hidden = true
-    box.textContent = ''
+    clearFieldErrors(document.getElementById('authScreen'))
+    if (box) {
+      box.hidden = true
+      box.textContent = ''
+    }
     return
   }
-  box.hidden = false
-  box.className = `auth-alert ${type} animate__animated animate__fadeIn`
-  box.textContent = message
+  if (box) {
+    box.hidden = false
+    box.className = `auth-alert ${type} animate__animated animate__fadeIn`
+    box.textContent = message
+  }
+  if (type === 'error') {
+    showErrorModal({ message, section: 'auth' })
+  } else if (type === 'success') {
+    showSuccessToast(message)
+  }
 }
 
 function setAdminAlert(type, message) {
   const box = document.getElementById('adminAlertBox')
-  if (!box) return
   if (!message) {
-    box.hidden = true
-    box.textContent = ''
+    clearFieldErrors(document.getElementById('adminScreen'))
+    if (box) {
+      box.hidden = true
+      box.textContent = ''
+    }
     return
   }
-  box.hidden = false
-  box.className = `auth-alert ${type} animate__animated animate__fadeIn`
-  box.textContent = message
+  if (box) {
+    box.hidden = false
+    box.className = `auth-alert ${type} animate__animated animate__fadeIn`
+    box.textContent = message
+  }
+  if (type === 'error') {
+    showErrorModal({ message, section: 'admin' })
+  } else if (type === 'success') {
+    showSuccessToast(message)
+  }
 }
 
 function setProfileAlert(type, message) {
   const box = document.getElementById('profileAlertBox')
-  if (!box) return
   if (!message) {
-    box.hidden = true
-    box.textContent = ''
+    clearFieldErrors(document.getElementById('profileScreen'))
+    if (box) {
+      box.hidden = true
+      box.textContent = ''
+    }
     return
   }
-  box.hidden = false
-  box.className = `auth-alert ${type} animate__animated animate__fadeIn`
-  box.textContent = message
+  if (box) {
+    box.hidden = false
+    box.className = `auth-alert ${type} animate__animated animate__fadeIn`
+    box.textContent = message
+  }
+  if (type === 'error') {
+    showErrorModal({ message, section: 'profile' })
+  } else if (type === 'success') {
+    showSuccessToast(message)
+  }
 }
 
 function setStockAlert(type, message) {
   const box = document.getElementById('stockAlertBox')
-  if (!box) return
   if (!message) {
-    box.hidden = true
-    box.textContent = ''
+    clearFieldErrors(document.getElementById('stockScreen'))
+    if (box) {
+      box.hidden = true
+      box.textContent = ''
+    }
     return
   }
-  box.hidden = false
-  box.className = `auth-alert ${type} animate__animated animate__fadeIn`
-  box.textContent = message
+  if (box) {
+    box.hidden = false
+    box.className = `auth-alert ${type} animate__animated animate__fadeIn`
+    box.textContent = message
+  }
+  if (type === 'error') {
+    showErrorModal({ message, section: 'stock' })
+  } else if (type === 'success') {
+    showSuccessToast(message)
+  }
+}
+
+function setSettingsAlert(type, message) {
+  const box = document.getElementById('settingsAlertBox')
+  if (!message) {
+    clearFieldErrors(document.getElementById('settingsScreen'))
+    if (box) {
+      box.hidden = true
+      box.textContent = ''
+    }
+    return
+  }
+  if (box) {
+    box.hidden = false
+    box.className = `auth-alert ${type} animate__animated animate__fadeIn`
+    box.textContent = message
+  }
+  if (type === 'error') {
+    showErrorModal({ message, section: 'settings' })
+  } else if (type === 'success') {
+    showSuccessToast(message)
+  }
 }
 
 export function switchAuthMode(mode, alertMsg = '') {
@@ -446,7 +571,7 @@ function renderAuthScreen() {
                 ${
                   appAuthState.user
                     ? `<div class="auth-links">
-                        <button type="button" class="text-button" id="cancelUpdatePassBtn">← Volver al taller</button>
+                        <button type="button" class="text-button" id="cancelUpdatePassBtn">← Volver</button>
                       </div>`
                     : ''
                 }
@@ -632,6 +757,8 @@ function getCurrentActiveScreenName() {
   if (!document.getElementById('adminScreen')?.hidden) return 'admin'
   if (!document.getElementById('profileScreen')?.hidden) return 'profile'
   if (!document.getElementById('stockScreen')?.hidden) return 'stock'
+  const settingsEl = document.getElementById('settingsScreen')
+  if (settingsEl && !settingsEl.hidden) return 'settings'
   if (!document.getElementById('workScreen')?.hidden) return 'work'
   return 'jobs'
 }
@@ -715,6 +842,10 @@ export async function restoreSavedNavigationState(savedOverride = null) {
     await openAdminScreen()
     return true
   }
+  if (saved.screen === 'settings') {
+    await openSettingsScreen()
+    return true
+  }
   if (saved.screen === 'profile' && activeMembership) {
     await openProfileScreen()
     return true
@@ -726,8 +857,22 @@ export async function restoreSavedNavigationState(savedOverride = null) {
   if (saved.screen === 'work' && saved.activeJobId && window.store?.jobs?.length) {
     const targetJob = window.store.jobs.find(j => j.id === saved.activeJobId)
     if (targetJob) {
-      const keepCurrentForm = window.active?.id === targetJob.id && window.step === saved.step &&
-        window.active?.area === saved.area && Number(window.page || 0) === saved.page &&
+      const adminScreen = document.getElementById('adminScreen')
+      const profileScreen = document.getElementById('profileScreen')
+      const stockScreen = document.getElementById('stockScreen')
+      const settingsScreen = document.getElementById('settingsScreen')
+      const jobsScreen = document.getElementById('jobsScreen')
+      const workScreen = document.getElementById('workScreen')
+      const targetStep = saved.step || 'reception'
+      const stepEl = document.getElementById(`${targetStep}Step`)
+      const keepCurrentForm =
+        window.active === targetJob &&
+        window.step === targetStep &&
+        workScreen?.dataset.renderedJobId === String(targetJob.id) &&
+        workScreen?.dataset.renderedStep === String(targetStep) &&
+        Boolean(stepEl && !stepEl.hidden) &&
+        window.active?.area === saved.area &&
+        Number(window.page || 0) === saved.page &&
         appAuthState.activePieceKey === saved.activePieceKey
       if (saved.area) {
         targetJob.area = saved.area
@@ -737,14 +882,10 @@ export async function restoreSavedNavigationState(savedOverride = null) {
         ? saved.openPieceDetailsKeys
         : []
 
-      const adminScreen = document.getElementById('adminScreen')
-      const profileScreen = document.getElementById('profileScreen')
-      const stockScreen = document.getElementById('stockScreen')
-      const jobsScreen = document.getElementById('jobsScreen')
-      const workScreen = document.getElementById('workScreen')
       if (adminScreen) adminScreen.hidden = true
       if (profileScreen) profileScreen.hidden = true
       if (stockScreen) stockScreen.hidden = true
+      if (settingsScreen) settingsScreen.hidden = true
       if (jobsScreen) jobsScreen.hidden = true
       if (workScreen) workScreen.hidden = false
 
@@ -753,10 +894,17 @@ export async function restoreSavedNavigationState(savedOverride = null) {
       window.screen = 'work'
       if (!keepCurrentForm) {
         window.fillReception?.()
-        window.showStep?.(saved.step || 'reception', false)
+        window.showStep?.(targetStep, false)
+      }
+      if (workScreen) {
+        workScreen.dataset.renderedJobId = String(targetJob.id)
+        workScreen.dataset.renderedStep = String(window.step || targetStep)
+      }
+      if (targetStep === 'budget') {
+        prepareBudgetDelivery().catch(() => {})
       }
 
-      if ((saved.step || 'reception') === 'inspection') {
+      if (targetStep === 'inspection') {
         window.page = Number(saved.page || 0)
         const mapDisclosureEl = document.getElementById('mapDisclosure')
         if (mapDisclosureEl && typeof saved.mapOpen === 'boolean') {
@@ -938,7 +1086,7 @@ export function openMyProfile() {
   dialog.setAttribute('aria-labelledby', 'personalProfileTitle')
   dialog.innerHTML = `
     <div class="personal-profile-top">
-      <button type="button" class="profile-back" id="backFromMyProfileBtn">${backIcon} Volver a la sección anterior</button>
+      <button type="button" class="profile-back" id="backFromMyProfileBtn">${backIcon} Volver</button>
       <p class="eyebrow">CRASH SOLUTION · TU CUENTA</p>
       <h2 id="personalProfileTitle">Mi perfil</h2>
       <p>Tu información personal y tu lugar en el equipo.</p>
@@ -1018,10 +1166,16 @@ export function openMyProfile() {
       setEditing(false)
       alert.className = 'auth-alert success'
       alert.textContent = 'Tus datos se guardaron correctamente.'
+      showSuccessToast('Tus datos se guardaron correctamente.')
     } catch (error) {
       setEditing(true)
       alert.className = 'auth-alert error'
       alert.textContent = error.message
+      showErrorModal({
+        message: error.message || 'No se pudieron actualizar tus datos personales.',
+        section: 'personal_profile',
+        field: nameInput
+      })
     } finally {
       saving = false
       dialog.querySelectorAll('button').forEach(button => { button.disabled = false })
@@ -1056,6 +1210,7 @@ export function renderHeaderNavigation() {
     lastHeaderMarkup = ''
     window.__headerMenuController?.abort()
     document.getElementById('myProfileDialog')?.remove()
+    document.getElementById('settingsScreen')?.replaceChildren()
     const brand = document.querySelector('.brand span:nth-child(2)')
     if (brand) brand.innerHTML = 'CRASH SOLUTION<small>Gestión del taller</small>'
     navContainer.innerHTML = ''
@@ -1069,15 +1224,6 @@ export function renderHeaderNavigation() {
     appAuthState.profile?.display_name ||
     appAuthState.user.user_metadata?.display_name ||
     appAuthState.user.email
-
-  const workshopOptions = appAuthState.memberships
-    .map(
-      m =>
-        `<option value="${esc(m.workshop_id)}" ${
-          m.workshop_id === activeMembership?.workshop_id ? 'selected' : ''
-        }>${esc(m.workshop.name)} (${esc(ROLE_LABELS[m.role] || m.role)})</option>`
-    )
-    .join('')
 
   const currentRoute = readAppRoute(window.location).name
   const isAdminView = currentRoute === 'admin'
@@ -1113,23 +1259,25 @@ export function renderHeaderNavigation() {
     <div id="userMenu" class="profile-dropdown" hidden>
     <div class="profile-identity"><strong>${esc(displayName)}</strong><span class="role-chip ${esc(role)}">${esc(roleLabel)}</span></div>
     <button type="button" id="navMyProfileBtn">Mi perfil</button>
-    ${activeMembership ? '<button type="button" id="navProfileBtn">Perfil y datos del taller</button>' : ''}
-    <button type="button" id="navChangePassBtn" ${currentRoute === 'password' ? 'aria-current="page"' : ''}>Cambiar contraseña</button>
-    <button type="button" id="navSettingsBtn">Configuración</button>
+    ${activeMembership || appAuthState.memberships.length > 0 ? `<button type="button" id="navProfileBtn" ${currentRoute === 'profile' ? 'aria-current="page"' : ''}>Mi taller</button>` : ''}
+    <button type="button" id="navSettingsBtn" ${['settings', 'password'].includes(currentRoute) ? 'aria-current="page"' : ''}>Configuración</button>
     <span id="connectivityBadge" class="conn-badge ${connClass}" role="status" aria-live="polite" title="Estado de conexión y sincronización">
       <span class="conn-dot"></span>
       <span>${esc(connLabel)}</span>
     </span>
-    ${
-      appAuthState.memberships.length > 0
-        ? `<select id="activeWorkshopSelect" class="workshop-switcher" aria-label="Taller activo">
-            ${workshopOptions}
-          </select>`
-        : ''
-    }
     <button type="button" id="navLogoutBtn">Cerrar sesión</button>
     </div></div>
   `
+  const settingsEl = ensureSettingsScreenElement()
+  if (settingsEl && !settingsEl.querySelector('#navChangePassBtn')) {
+    renderSettingsScreen()
+  }
+  const changePassBtn = document.getElementById('navChangePassBtn')
+  if (changePassBtn) {
+    if (currentRoute === 'password') changePassBtn.setAttribute('aria-current', 'page')
+    else changePassBtn.removeAttribute('aria-current')
+  }
+
   if (lastHeaderMarkup === markup && navContainer.dataset.navBound === 'true' && navContainer.querySelector('#profileMenuToggle')) return
   navContainer.innerHTML = markup
   navContainer.dataset.navBound = 'true'
@@ -1161,38 +1309,17 @@ export function renderHeaderNavigation() {
   window.__headerMenuController = controller
   document.addEventListener('click', e => { if (!navContainer.contains(e.target)) closeMenus() }, { signal: controller.signal })
   document.addEventListener('keydown', e => {
-    if (e.key === 'Escape') { closeMenus(); document.getElementById('profileMenuToggle')?.focus() }
+    if (e.key === 'Escape') {
+      const menuOpen = !document.getElementById('userMenu')?.hidden || document.getElementById('primaryNavigation')?.classList.contains('is-open')
+      closeMenus()
+      if (menuOpen) document.getElementById('profileMenuToggle')?.focus()
+    }
   }, { signal: controller.signal })
   navContainer.addEventListener('click', e => {
     if (e.target.closest('#userMenu button, #primaryNavigation button')) closeMenus()
   }, { signal: controller.signal })
-  document.getElementById('navSettingsBtn').onclick = () => { window.openSettings?.() }
+  document.getElementById('navSettingsBtn').onclick = () => { openSettingsScreen() }
   document.getElementById('navMyProfileBtn').onclick = openMyProfile
-
-  document.getElementById('activeWorkshopSelect')?.addEventListener('change', async e => {
-    const previousMembership = getActiveMembership()
-    if (window.active?.rec?.cliente?.trim() && window.active?.rec?.patente?.trim() && previousMembership) {
-      clearTimeout(window.__jobCloudTimer)
-      window.__jobCloudTimer = null
-      await enqueueJobSyncOperation({ userId: appAuthState.user.id, workshopId: previousMembership.workshop_id, job: window.active })
-    }
-    appAuthState.activeWorkshopId = e.target.value
-    clearWorkshopReadState()
-    privateReadCache.activate({ userId: appAuthState.user?.id, workshopId: appAuthState.activeWorkshopId })
-    localStorage.setItem('mitaller_active_workshop_id', appAuthState.activeWorkshopId)
-    if (window.store) { window.store.jobs = []; window.store.activeId = null }
-    window.active = null
-    await syncActiveWorkshopToLegacyStore()
-    await loadWorkshopJobsFromSupabase()
-    if (!document.getElementById('adminScreen')?.hidden) {
-      await renderAdminScreen()
-    } else if (!document.getElementById('profileScreen')?.hidden) {
-      await renderProfileScreen()
-    } else if (!document.getElementById('stockScreen')?.hidden) {
-      await renderStockScreen()
-    }
-    await enforceRouteProtection()
-  })
 
   document.getElementById('navJobsBtn')?.addEventListener('click', () => {
     navigateAppRoute({ name: 'jobs' })
@@ -1215,6 +1342,102 @@ export function renderHeaderNavigation() {
   })
 
   document.getElementById('navLogoutBtn')?.addEventListener('click', handleLogout)
+}
+
+const workshopDraftJobsByScope = new Map()
+
+export async function switchActiveWorkshop(targetWorkshopId) {
+  if (!targetWorkshopId) return false
+  const targetMembership = appAuthState.memberships.find(m => m.workshop_id === targetWorkshopId)
+  if (!targetMembership) return false
+
+  const userId = appAuthState.user?.id
+  const previousMembership = getActiveMembership()
+  const previousWorkshopId = previousMembership?.workshop_id || appAuthState.activeWorkshopId
+
+  // 1. Conservar navegación y borradores del taller anterior antes de cambiar
+  if (userId && previousWorkshopId) {
+    persistCurrentNavigationState()
+    if (!document.getElementById('workScreen')?.hidden) {
+      syncActiveJobFromDom()
+    }
+    const currentJobs = Array.isArray(window.store?.jobs) ? [...window.store.jobs] : []
+    if (window.active && !currentJobs.some(j => j.id === window.active.id)) {
+      currentJobs.unshift(window.active)
+    }
+    if (currentJobs.length > 0) {
+      workshopDraftJobsByScope.set(`${userId}:${previousWorkshopId}`, JSON.parse(JSON.stringify(currentJobs)))
+      for (const jobItem of currentJobs) {
+        await saveOfflineJob({
+          userId,
+          workshopId: previousWorkshopId,
+          job: jobItem,
+          syncStatus: 'pending'
+        }).catch(() => {})
+      }
+    }
+    if (window.active?.rec?.cliente?.trim() && window.active?.rec?.patente?.trim()) {
+      clearTimeout(window.__jobCloudTimer)
+      window.__jobCloudTimer = null
+      await enqueueJobSyncOperation({
+        userId,
+        workshopId: previousWorkshopId,
+        job: window.active
+      }).catch(() => {})
+    }
+  }
+
+  // 2. Activar el nuevo taller y aislar cachés/estados
+  appAuthState.activeWorkshopId = targetWorkshopId
+  appAuthState.activeWorkshopProfile = targetMembership.workshop ? { ...targetMembership.workshop } : null
+  clearWorkshopReadState()
+  privateReadCache.activate({ userId, workshopId: targetWorkshopId })
+  localStorage.setItem('mitaller_active_workshop_id', targetWorkshopId)
+  appAuthState.workshopSettings = getWorkshopSettings(targetWorkshopId)
+
+  const restoredMemoryJobs = userId ? workshopDraftJobsByScope.get(`${userId}:${targetWorkshopId}`) : null
+  if (window.store) {
+    window.store.jobs = restoredMemoryJobs ? JSON.parse(JSON.stringify(restoredMemoryJobs)) : []
+    window.store.activeId = null
+  }
+  window.active = null
+
+  // 3. Actualizar perfil comercial, trabajos, stock y permisos del nuevo taller
+  await syncActiveWorkshopToLegacyStore()
+  await loadWorkshopJobsFromSupabase()
+  if (restoredMemoryJobs?.length && window.store && (!window.store.jobs || !window.store.jobs.length)) {
+    window.store.jobs = JSON.parse(JSON.stringify(restoredMemoryJobs))
+  }
+  try {
+    const nextStock = await fetchWorkshopStock(targetWorkshopId, { force: true })
+    if (appAuthState.activeWorkshopId === targetWorkshopId) {
+      appAuthState.stockItems = nextStock
+    }
+  } catch {
+    // Mantiene lista vacía si el taller no tiene stock o está sin conexión
+  }
+
+  renderHeaderNavigation()
+
+  if (!document.getElementById('profileScreen')?.hidden) {
+    await renderProfileScreen()
+    setProfileAlert(
+      'success',
+      `Taller activo cambiado a "${targetMembership.workshop?.name || targetWorkshopId}" (${ROLE_LABELS[targetMembership.role] || targetMembership.role}).`
+    )
+  } else if (!document.getElementById('adminScreen')?.hidden) {
+    await renderAdminScreen()
+  } else if (!document.getElementById('stockScreen')?.hidden) {
+    await renderStockScreen({ force: true })
+  } else if (!document.getElementById('settingsScreen')?.hidden) {
+    await renderSettingsScreen()
+  } else if (!document.getElementById('jobsScreen')?.hidden) {
+    window.renderJobs?.()
+  }
+
+  await enforceRouteProtection()
+  window.toast?.(`Taller activo: ${targetMembership.workshop?.name || targetWorkshopId}`)
+  return true
 }
 
 export async function syncActiveWorkshopToLegacyStore({ useMembership = false } = {}) {
@@ -1362,10 +1585,19 @@ export async function syncPendingJobsWithSupabase({ manual = false } = {}) {
 function syncActiveJobReferenceInMemory() {
   if (!window.active?.id || !Array.isArray(window.store?.jobs)) return
   const currentArea = window.active.area
-  const matched = window.store.jobs.find(j => j.id === window.active.id)
-  if (matched) {
-    if (currentArea) matched.area = currentArea
-    window.active = matched
+  const matchedIdx = window.store.jobs.findIndex(j => j.id === window.active.id)
+  if (matchedIdx >= 0) {
+    const matched = window.store.jobs[matchedIdx]
+    const activeTime = Date.parse(window.active.updatedAt || '') || 0
+    const matchedTime = Date.parse(matched.updatedAt || '') || 0
+    if (window.__jobCloudTimer || activeTime > matchedTime) {
+      window.store.jobs[matchedIdx] = window.active
+    } else {
+      if (currentArea) matched.area = currentArea
+      window.active = matched
+    }
+  } else {
+    window.store.jobs.unshift(window.active)
   }
 }
 
@@ -1536,11 +1768,13 @@ export async function openProfileScreen({ fromRoute = false } = {}) {
   const workScreen = document.getElementById('workScreen')
   const adminScreen = document.getElementById('adminScreen')
   const stockScreen = document.getElementById('stockScreen')
+  const settingsScreen = document.getElementById('settingsScreen')
   const profileScreen = document.getElementById('profileScreen')
   if (jobsScreen) jobsScreen.hidden = true
   if (workScreen) workScreen.hidden = true
   if (adminScreen) adminScreen.hidden = true
   if (stockScreen) stockScreen.hidden = true
+  if (settingsScreen) settingsScreen.hidden = true
   if (profileScreen) profileScreen.hidden = false
   persistCurrentNavigationState({ screen: 'profile' })
   renderHeaderNavigation()
@@ -1570,23 +1804,55 @@ export async function renderProfileScreen() {
 
   const canEdit = canAccessAdminPanel(activeMembership.role)
   const previewHeaderHtml = buildBudgetWorkshopHeaderHtml(ws, 'OT-DEMO01', '03/11/2026', '18/11/2026')
+  const activeRoleLabel = ROLE_LABELS[activeMembership.role] || activeMembership.role
+  const workshopOptions = appAuthState.memberships
+    .map(
+      m =>
+        `<option value="${esc(m.workshop_id)}" ${
+          m.workshop_id === activeMembership?.workshop_id ? 'selected' : ''
+        }>${esc(m.workshop?.name || m.workshop_id)} (${esc(ROLE_LABELS[m.role] || m.role)})</option>`
+    )
+    .join('')
 
   if (routeScope() !== expectedScope) return
   profileScreen.innerHTML = `
-    <div class="page-heading">
-      <div>
-        <p class="eyebrow">IDENTIDAD COMERCIAL Y PRESUPUESTOS</p>
-        <h1>Perfil del Taller</h1>
-        <p class="subtitle">Configurá los datos comerciales, de contacto y el logo oficial que se incluyen automáticamente en todos los presupuestos en PDF y mensajes de WhatsApp.</p>
+    <div class="personal-profile-top unified-screen-top">
+      <div class="unified-screen-top-bar">
+        <button type="button" class="profile-back" id="backFromProfileBtn">← Volver</button>
       </div>
-      <button type="button" class="button secondary" id="backFromProfileBtn">← Volver a Trabajos</button>
+      <p class="eyebrow">IDENTIDAD COMERCIAL Y PRESUPUESTOS</p>
+      <h1>Mi taller</h1>
+      <p>Configurá los datos comerciales, de contacto y el logo oficial que se incluyen automáticamente en todos los presupuestos en PDF y mensajes de WhatsApp.</p>
     </div>
 
     <div id="profileAlertBox" class="auth-alert" role="alert" hidden></div>
 
+    <div class="admin-card workshop-selector-card" style="margin-bottom:20px">
+      <div class="workshop-selector-header">
+        <div>
+          <span class="eyebrow">TALLER ASIGNADO</span>
+          <h2 id="activeWorkshopSectionTitle">Taller o sucursal activa</h2>
+          <p class="subtitle">Seleccioná el taller con el que querés operar. Al cambiar de taller se actualizan sus trabajos, stock, perfil comercial y permisos.</p>
+        </div>
+        <div class="active-workshop-summary" id="activeWorkshopSummary">
+          <span class="small muted">Taller activo:</span>
+          <strong id="activeWorkshopNameBadge">${esc(ws.name || activeMembership.workshop.name)}</strong>
+          <span class="role-chip ${esc(activeMembership.role)}" id="activeWorkshopRoleBadge">${esc(activeRoleLabel)}</span>
+        </div>
+      </div>
+      <div class="workshop-selector-controls">
+        <label for="activeWorkshopSelect" class="workshop-selector-label">
+          <span>Seleccionar taller o sucursal</span>
+          <select id="activeWorkshopSelect" class="workshop-switcher" aria-label="Taller o sucursal activa">
+            ${workshopOptions}
+          </select>
+        </label>
+      </div>
+    </div>
+
     ${
       !canEdit
-        ? `<div class="notice">Tu rol actual en este taller es <b>${esc(ROLE_LABELS[activeMembership.role] || activeMembership.role)}</b>. Podés consultar los datos del taller, pero solo el Propietario o Administrador pueden modificarlos.</div>`
+        ? `<div class="notice">Tu rol actual en este taller es <b>${esc(activeRoleLabel)}</b>. Podés consultar los datos del taller, pero solo el Propietario o Administrador pueden modificarlos.</div>`
         : ''
     }
 
@@ -1690,7 +1956,11 @@ export async function renderProfileScreen() {
   `
 
   document.getElementById('backFromProfileBtn')?.addEventListener('click', () => {
-    navigateAppRoute({ name: 'jobs' })
+    goBackAppRoute({ name: 'jobs' })
+  })
+
+  document.getElementById('activeWorkshopSelect')?.addEventListener('change', async e => {
+    await switchActiveWorkshop(e.target.value)
   })
 
   // Formateo automático de CUIT al salir del campo y actualización de vista previa en vivo
@@ -1843,18 +2113,20 @@ export async function openStockScreen({ fromRoute = false } = {}) {
   const workScreen = document.getElementById('workScreen')
   const profileScreen = document.getElementById('profileScreen')
   const adminScreen = document.getElementById('adminScreen')
+  const settingsScreen = document.getElementById('settingsScreen')
   const stockScreen = document.getElementById('stockScreen')
   if (jobsScreen) jobsScreen.hidden = true
   if (workScreen) workScreen.hidden = true
   if (profileScreen) profileScreen.hidden = true
   if (adminScreen) adminScreen.hidden = true
+  if (settingsScreen) settingsScreen.hidden = true
   if (stockScreen) stockScreen.hidden = false
   persistCurrentNavigationState({ screen: 'stock' })
   renderHeaderNavigation()
   await renderStockScreen()
 }
 
-export async function renderStockScreen() {
+export async function renderStockScreen(options = {}) {
   const expectedScope = routeScope()
   const stockScreen = document.getElementById('stockScreen')
   if (!stockScreen) return
@@ -1866,19 +2138,25 @@ export async function renderStockScreen() {
   }
 
   const ws = activeMembership.workshop
-  try {
-    const [items, movements] = await Promise.all([
-      fetchWorkshopStock(ws.id),
-      fetchStockMovements(ws.id, null, 60)
-    ])
-    if (routeScope() !== expectedScope) return
-    appAuthState.stockItems = items
-    appAuthState.stockMovements = movements
-  } catch (err) {
-    console.warn('Error cargando stock desde Supabase:', err)
+  const forceRefresh = Boolean(options?.force)
+  const [itemsResult, movementsResult] = await Promise.allSettled([
+    fetchWorkshopStock(ws.id, { force: forceRefresh }),
+    fetchStockMovements(ws.id, null, 60, { force: forceRefresh })
+  ])
+  if (routeScope() !== expectedScope) return
+  if (itemsResult.status === 'fulfilled' && Array.isArray(itemsResult.value)) {
+    appAuthState.stockItems = itemsResult.value
+  } else if (itemsResult.status === 'rejected') {
+    console.warn('Error cargando stock desde Supabase:', itemsResult.reason)
+  }
+  if (movementsResult.status === 'fulfilled' && Array.isArray(movementsResult.value)) {
+    appAuthState.stockMovements = movementsResult.value
+  } else if (movementsResult.status === 'rejected') {
+    console.warn('Error cargando movimientos de stock desde Supabase:', movementsResult.reason)
   }
 
-  const activeItems = appAuthState.stockItems.filter(i => !i.archived_at)
+  const activeItems = getActiveStockItems(appAuthState.stockItems, ws.id)
+  const activeCount = countActiveStockItems(appAuthState.stockItems, ws.id)
   const lowStockItems = activeItems.filter(i => isLowStock(i))
 
   const editing = appAuthState.editingStockItem
@@ -1887,16 +2165,14 @@ export async function renderStockScreen() {
 
   if (routeScope() !== expectedScope) return
   stockScreen.innerHTML = `
-    <div class="page-heading">
-      <div>
-        <p class="eyebrow">INVENTARIO Y DEPÓSITO</p>
-        <h1>Stock de ${esc(ws.name)}</h1>
-        <p class="subtitle">Pinturas, materiales, insumos y repuestos con compatibilidad por vehículo, avisos de faltantes y registro completo de entradas y salidas.</p>
+    <div class="personal-profile-top unified-screen-top">
+      <div class="unified-screen-top-bar">
+        <button type="button" class="profile-back" id="backFromStockBtn">← Volver</button>
+        <button type="button" class="button primary small-btn" id="openNewStockItemBtn">+ Nuevo producto / repuesto</button>
       </div>
-      <div style="display:flex;gap:10px;flex-wrap:wrap">
-        <button type="button" class="button primary" id="openNewStockItemBtn">+ Nuevo producto / repuesto</button>
-        <button type="button" class="button secondary" id="backFromStockBtn">← Volver a Trabajos</button>
-      </div>
+      <p class="eyebrow">INVENTARIO Y DEPÓSITO</p>
+      <h1>Stock de ${esc(ws.name)}</h1>
+      <p>Pinturas, materiales, insumos y repuestos con compatibilidad por vehículo, avisos de faltantes y registro completo de entradas y salidas.</p>
     </div>
 
     <div id="stockAlertBox" class="auth-alert" role="alert" hidden></div>
@@ -1905,7 +2181,7 @@ export async function renderStockScreen() {
     <div class="dashboard-stats stock-summary-stats">
       <div class="dashboard-stat">
         <span>Productos activos</span>
-        <b>${activeItems.length}</b>
+        <b id="activeProductsCount">${activeCount}</b>
       </div>
       <div class="dashboard-stat" style="cursor:pointer" id="filterLowStockStatBtn" title="Filtrar productos con alerta de stock bajo">
         <span>Alertas de stock mínimo</span>
@@ -1974,7 +2250,7 @@ export async function renderStockScreen() {
             : '+ Dar de alta nuevo producto, insumo, pintura o repuesto'
         }
       </summary>
-      <form id="stockItemForm" style="margin-top:18px">
+      <form id="stockItemForm" novalidate style="margin-top:18px">
         <div class="form-grid">
           <label>Nombre del producto <span class="required">*</span>
             <input id="stName" required maxlength="120" value="${esc(editing?.name || '')}" placeholder="Ej. Espejo retrovisor exterior derecho / Barniz bicapa 2K">
@@ -2003,7 +2279,7 @@ export async function renderStockScreen() {
             <input id="stLocation" maxlength="100" value="${esc(editing?.location || '')}" placeholder="Ej. Pasillo 2 · Estante B · Caja 4">
           </label>
           <label>Precio de compra (ARS)
-            <input id="stPurchasePrice" type="number" min="0" step="0.01" value="${editing?.purchase_price ?? 0}">
+            <input id="stPurchasePrice" type="number" min="0" step="1" inputmode="numeric" value="${editing?.purchase_price ?? 0}">
           </label>
           <label>Stock mínimo (aviso de faltante)
             <input id="stMinQty" type="number" min="0" step="0.01" value="${editing?.minimum_quantity ?? 1}">
@@ -2115,7 +2391,7 @@ export async function renderStockScreen() {
   renderMovementHistorySection()
 
   document.getElementById('backFromStockBtn')?.addEventListener('click', () => {
-    navigateAppRoute({ name: 'jobs' })
+    goBackAppRoute({ name: 'jobs' })
   })
 
   document.getElementById('openNewStockItemBtn')?.addEventListener('click', () => {
@@ -2164,14 +2440,17 @@ export async function renderStockScreen() {
       btn.textContent = 'Registrando movimiento…'
     }
     try {
-      await recordStockMovement({
+      const updatedRow = await recordStockMovement({
         itemId: movItem.id,
         currentQuantity: movItem.quantity,
         quantityChange,
         reason
       })
+      if (updatedRow?.id) {
+        appAuthState.stockItems = appAuthState.stockItems.map(i => (i.id === updatedRow.id ? { ...i, ...updatedRow } : i))
+      }
       appAuthState.movementTargetItem = null
-      await renderStockScreen()
+      await renderStockScreen({ force: true })
       setStockAlert('success', `Movimiento registrado (${quantityChange > 0 ? `+${quantityChange}` : quantityChange} ${movItem.unit || 'un.'}) para "${movItem.name}".`)
       window.toast?.('Stock actualizado correctamente.')
     } catch (err) {
@@ -2203,12 +2482,23 @@ export async function renderStockScreen() {
     renderStockScreen()
   })
 
+  const purchasePriceInput = document.getElementById('stPurchasePrice')
+  purchasePriceInput?.addEventListener('keydown', e => {
+    if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return
+    e.preventDefault()
+    const currentRaw = String(purchasePriceInput.value ?? '0').trim().replace(',', '.')
+    const currentNum = Number(currentRaw)
+    const base = Number.isFinite(currentNum) ? Math.trunc(currentNum) : 0
+    const delta = e.key === 'ArrowUp' ? 1 : -1
+    purchasePriceInput.value = String(Math.max(0, base + delta))
+    purchasePriceInput.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+
   document.getElementById('stockItemForm')?.addEventListener('submit', async e => {
     e.preventDefault()
     syncDraftCompatibilitiesFromDom()
     const btn = document.getElementById('saveStockItemBtn')
     setStockAlert('', '')
-    if (btn) btn.disabled = true
 
     const payload = {
       name: document.getElementById('stName')?.value,
@@ -2224,18 +2514,32 @@ export async function renderStockScreen() {
       notes: document.getElementById('stNotes')?.value
     }
 
+    const validation = validateStockItemInput(payload)
+    if (!validation.valid) {
+      setStockAlert('error', validation.error)
+      return
+    }
+
+    if (btn) btn.disabled = true
+
     try {
       if (editing?.id) {
-        await updateStockItem(ws.id, editing.id, payload, appAuthState.draftCompatibilities)
+        const updatedItem = await updateStockItem(ws.id, editing.id, payload, appAuthState.draftCompatibilities)
+        if (updatedItem?.id) {
+          appAuthState.stockItems = appAuthState.stockItems.map(i => (i.id === updatedItem.id ? { ...i, ...updatedItem } : i))
+        }
         appAuthState.editingStockItem = null
         appAuthState.draftCompatibilities = []
-        await renderStockScreen()
+        await renderStockScreen({ force: true })
         setStockAlert('success', 'Producto y compatibilidad actualizados correctamente.')
       } else {
-        await createStockItem(ws.id, payload, appAuthState.draftCompatibilities)
+        const createdItem = await createStockItem(ws.id, payload, appAuthState.draftCompatibilities)
+        if (createdItem?.id && !appAuthState.stockItems.some(i => i.id === createdItem.id)) {
+          appAuthState.stockItems = [{ ...createdItem, compatibilities: [...appAuthState.draftCompatibilities] }, ...appAuthState.stockItems]
+        }
         appAuthState.editingStockItem = null
         appAuthState.draftCompatibilities = []
-        await renderStockScreen()
+        await renderStockScreen({ force: true })
         setStockAlert('success', 'Producto dado de alta en el inventario del taller.')
       }
     } catch (err) {
@@ -2363,7 +2667,7 @@ function renderStockItemsGrid() {
     return
   }
 
-  const fmtMoney = v => (window.money ? window.money(v) : `$${Number(v || 0).toLocaleString('es-AR')}`)
+  const fmtMoney = v => formatPurchasePriceArs(v)
 
   grid.innerHTML = filtered.slice(0, appAuthState.stockVisibleCount)
     .map(item => {
@@ -2471,8 +2775,13 @@ function renderStockItemsGrid() {
       const itemId = btn.dataset.archiveItem
       const isCurrentlyArchived = btn.dataset.archived === '1'
       try {
-        await archiveStockItem(activeMembership.workshop.id, itemId, !isCurrentlyArchived)
-        await renderStockScreen()
+        const updatedRow = await archiveStockItem(activeMembership.workshop.id, itemId, !isCurrentlyArchived)
+        appAuthState.stockItems = appAuthState.stockItems.map(i =>
+          i.id === itemId
+            ? { ...i, ...(updatedRow || {}), archived_at: !isCurrentlyArchived ? updatedRow?.archived_at || new Date().toISOString() : null }
+            : i
+        )
+        await renderStockScreen({ force: true })
         setStockAlert(
           'success',
           isCurrentlyArchived ? 'Producto restaurado al inventario activo.' : 'Producto archivado correctamente.'
@@ -2539,11 +2848,13 @@ export async function openAdminScreen({ fromRoute = false } = {}) {
   const workScreen = document.getElementById('workScreen')
   const profileScreen = document.getElementById('profileScreen')
   const stockScreen = document.getElementById('stockScreen')
+  const settingsScreen = document.getElementById('settingsScreen')
   const adminScreen = document.getElementById('adminScreen')
   if (jobsScreen) jobsScreen.hidden = true
   if (workScreen) workScreen.hidden = true
   if (profileScreen) profileScreen.hidden = true
   if (stockScreen) stockScreen.hidden = true
+  if (settingsScreen) settingsScreen.hidden = true
   if (adminScreen) adminScreen.hidden = false
   persistCurrentNavigationState({ screen: 'admin' })
   renderHeaderNavigation()
@@ -2581,20 +2892,18 @@ export async function renderAdminScreen() {
 
   if (routeScope() !== expectedScope) return
   adminScreen.innerHTML = `
-    <div class="page-heading">
-      <div>
-        <p class="eyebrow">ADMINISTRACIÓN Y EQUIPO</p>
-        <h1>Gestión de Talleres y Usuarios</h1>
-        <p class="subtitle">Administrá los datos de tu taller, los integrantes de tu equipo y los permisos de acceso de cada usuario.</p>
-      </div>
+    <div class="personal-profile-top unified-screen-top">
       ${
         appAuthState.memberships.length > 0
-          ? `<div style="display:flex;gap:10px;flex-wrap:wrap">
-              <button type="button" class="button secondary" id="goToProfileFromAdminBtn">Perfil y Logo del Taller</button>
-              <button type="button" class="button secondary" id="backFromAdminBtn">← Volver a Trabajos</button>
+          ? `<div class="unified-screen-top-bar">
+              <button type="button" class="profile-back" id="backFromAdminBtn">← Volver</button>
+              <button type="button" class="button secondary small-btn" id="goToProfileFromAdminBtn">Mi taller</button>
             </div>`
           : ''
       }
+      <p class="eyebrow">ADMINISTRACIÓN Y EQUIPO</p>
+      <h1>Gestión de Talleres y Usuarios</h1>
+      <p>Administrá los datos de tu taller, los integrantes de tu equipo y los permisos de acceso de cada usuario.</p>
     </div>
 
     <div id="adminAlertBox" class="auth-alert" role="alert" hidden></div>
@@ -2814,7 +3123,7 @@ export async function renderAdminScreen() {
   })
 
   document.getElementById('backFromAdminBtn')?.addEventListener('click', () => {
-    navigateAppRoute({ name: 'jobs' })
+    goBackAppRoute({ name: 'jobs' })
   })
 
   document.getElementById('copyMyUuidBtn')?.addEventListener('click', () => {
@@ -2826,12 +3135,7 @@ export async function renderAdminScreen() {
 
   document.querySelectorAll('[data-select-ws]').forEach(btn => {
     btn.addEventListener('click', async () => {
-      appAuthState.activeWorkshopId = btn.dataset.selectWs
-      localStorage.setItem('mitaller_active_workshop_id', appAuthState.activeWorkshopId)
-      await syncActiveWorkshopToLegacyStore()
-      await loadWorkshopJobsFromSupabase()
-      renderHeaderNavigation()
-      await renderAdminScreen()
+      await switchActiveWorkshop(btn.dataset.selectWs)
       window.toast?.('Taller activo cambiado.')
     })
   })
@@ -2854,7 +3158,12 @@ export async function renderAdminScreen() {
       })
       appAuthState.memberships = await fetchUserWorkshops(appAuthState.user.id)
       appAuthState.activeWorkshopId = ws.id
+      clearWorkshopReadState()
+      privateReadCache.activate({ userId: appAuthState.user?.id, workshopId: ws.id })
       localStorage.setItem('mitaller_active_workshop_id', ws.id)
+      appAuthState.workshopSettings = getWorkshopSettings(ws.id)
+      if (window.store) { window.store.jobs = []; window.store.activeId = null }
+      window.active = null
       await syncActiveWorkshopToLegacyStore()
       await loadWorkshopJobsFromSupabase()
       renderHeaderNavigation()
@@ -2983,6 +3292,249 @@ export async function renderAdminScreen() {
   })
 }
 
+// ============================================================================
+// DEV-33: Sección de Configuración (Seguridad, Contraseña y Parámetros)
+// ============================================================================
+export async function openSettingsScreen({ fromRoute = false } = {}) {
+  if (!fromRoute) return navigateAppRoute({ name: 'settings' })
+  if (!appAuthState.user || isSessionExpired(appAuthState.session)) {
+    await enforceRouteProtection()
+    return
+  }
+  const settingsScreen = ensureSettingsScreenElement()
+  const jobsScreen = document.getElementById('jobsScreen')
+  const workScreen = document.getElementById('workScreen')
+  const profileScreen = document.getElementById('profileScreen')
+  const stockScreen = document.getElementById('stockScreen')
+  const adminScreen = document.getElementById('adminScreen')
+  if (jobsScreen) jobsScreen.hidden = true
+  if (workScreen) workScreen.hidden = true
+  if (profileScreen) profileScreen.hidden = true
+  if (stockScreen) stockScreen.hidden = true
+  if (adminScreen) adminScreen.hidden = true
+  if (settingsScreen) settingsScreen.hidden = false
+  persistCurrentNavigationState({ screen: 'settings' })
+  renderHeaderNavigation()
+  await renderSettingsScreen()
+}
+
+export async function renderSettingsScreen() {
+  const settingsScreen = ensureSettingsScreenElement()
+  if (!settingsScreen) return
+
+  const activeMembership = getActiveMembership()
+  const ws = activeMembership?.workshop || null
+  const workshopId = ws?.id || appAuthState.activeWorkshopId || 'default'
+  const currentSettings = getWorkshopSettings(workshopId)
+  appAuthState.workshopSettings = currentSettings
+  const schemaGroups = getSettingsSchema()
+
+  const renderParamField = param => {
+    const val = currentSettings[param.key]
+    if (param.type === 'boolean') {
+      return `
+        <label class="span-two settings-checkbox-row" for="setting_${esc(param.key)}">
+          <input id="setting_${esc(param.key)}" data-setting-key="${esc(param.key)}" type="checkbox" ${val ? 'checked' : ''}>
+          <span>
+            <b>${esc(param.label)}</b>
+            ${param.description ? `<small class="muted small" style="display:block;font-weight:400">${esc(param.description)}</small>` : ''}
+          </span>
+        </label>
+      `
+    }
+    if (param.type === 'select') {
+      return `
+        <label for="setting_${esc(param.key)}">${esc(param.label)}
+          <select id="setting_${esc(param.key)}" data-setting-key="${esc(param.key)}">
+            ${(param.options || [])
+              .map(opt => `<option value="${esc(opt.value)}" ${val === opt.value ? 'selected' : ''}>${esc(opt.label)}</option>`)
+              .join('')}
+          </select>
+          ${param.description ? `<small class="muted small" style="display:block;margin-top:4px;font-weight:400">${esc(param.description)}</small>` : ''}
+        </label>
+      `
+    }
+    if (param.type === 'textarea') {
+      return `
+        <label class="span-two" for="setting_${esc(param.key)}">${esc(param.label)}
+          <textarea id="setting_${esc(param.key)}" data-setting-key="${esc(param.key)}" rows="2" maxlength="${param.maxLength || 500}" placeholder="${esc(param.placeholder || '')}">${esc(val ?? '')}</textarea>
+          ${param.description ? `<small class="muted small" style="display:block;margin-top:4px;font-weight:400">${esc(param.description)}</small>` : ''}
+        </label>
+      `
+    }
+    if (param.type === 'number') {
+      return `
+        <label for="setting_${esc(param.key)}">${esc(param.label)}
+          <input id="setting_${esc(param.key)}" data-setting-key="${esc(param.key)}" type="number" min="${param.min ?? 0}" max="${param.max ?? 999999}" step="${param.step ?? 1}" value="${esc(val ?? param.defaultValue ?? 0)}">
+          ${param.description ? `<small class="muted small" style="display:block;margin-top:4px;font-weight:400">${esc(param.description)}</small>` : ''}
+        </label>
+      `
+    }
+    return `
+      <label for="setting_${esc(param.key)}">${esc(param.label)}
+        <input id="setting_${esc(param.key)}" data-setting-key="${esc(param.key)}" type="text" maxlength="${param.maxLength || 200}" value="${esc(val ?? '')}">
+        ${param.description ? `<small class="muted small" style="display:block;margin-top:4px;font-weight:400">${esc(param.description)}</small>` : ''}
+      </label>
+    `
+  }
+
+  settingsScreen.innerHTML = `
+    <div class="personal-profile-top unified-screen-top">
+      <div class="unified-screen-top-bar">
+        <button type="button" class="profile-back" id="backFromSettingsBtn">← Volver</button>
+      </div>
+      <p class="eyebrow">CRASH SOLUTION · CONFIGURACIÓN</p>
+      <h1>Configuración</h1>
+      <p>Seguridad de tu cuenta, cambio de contraseña, parámetros operativos del taller y copias de respaldo.</p>
+    </div>
+
+    <div id="settingsAlertBox" class="auth-alert" role="alert" hidden></div>
+
+    <div class="admin-grid settings-grid">
+      <!-- Columna 1: Seguridad y Contraseña -->
+      <div class="admin-card">
+        <span class="eyebrow">SEGURIDAD DE LA CUENTA</span>
+        <h2>Cambiar contraseña</h2>
+        <p class="subtitle">Actualizá la clave de acceso de tu cuenta (${esc(appAuthState.user?.email || 'usuario autenticado')}).</p>
+
+        <form id="settingsPasswordForm" class="auth-form" style="margin-top:16px">
+          <label>Nueva contraseña (mínimo 8 caracteres) <span class="required">*</span>
+            <input id="settingsNewPassword" type="password" required minlength="8" autocomplete="new-password" placeholder="Mínimo 8 caracteres">
+          </label>
+          <label>Confirmar nueva contraseña <span class="required">*</span>
+            <input id="settingsConfirmPassword" type="password" required minlength="8" autocomplete="new-password" placeholder="Repetí la nueva contraseña">
+          </label>
+          <button type="submit" class="button primary" id="settingsUpdatePassBtn">Guardar nueva contraseña</button>
+        </form>
+
+        <div class="quiet-details" style="margin-top:16px;padding-top:12px">
+          <button type="button" class="text-button" id="navChangePassBtn">Cambiar contraseña en vista dedicada →</button>
+        </div>
+
+        <details class="quiet-details" open>
+          <summary>Copia de respaldo (Exportar / Importar)</summary>
+          <p class="muted small">Descargá una copia de seguridad de los trabajos o restaurá un archivo guardado previamente.</p>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">
+            <button type="button" class="button secondary small-btn" id="settingsExportBackupBtn">Descargar copia de respaldo</button>
+            <label class="button secondary small-btn" style="cursor:pointer">
+              Importar copia de respaldo
+              <input type="file" id="settingsImportBackupInput" accept=".json,application/json" hidden>
+            </label>
+          </div>
+        </details>
+      </div>
+
+      <!-- Columna 2: Parámetros Operativos del Taller -->
+      <div class="admin-card">
+        <span class="eyebrow">PARÁMETROS OPERATIVOS</span>
+        <h2>Parámetros del taller ${ws ? `(${esc(ws.name)})` : ''}</h2>
+        <p class="subtitle">Definí los valores predeterminados para nuevos ingresos, inspecciones y presupuestos.</p>
+
+        <form id="workshopSettingsForm" style="margin-top:16px">
+          ${schemaGroups
+            .map(
+              group => `
+              <div class="settings-group-block" data-settings-group="${esc(group.id)}">
+                <div class="settings-group-header">
+                  <h3>${esc(group.title)}</h3>
+                  <p class="small muted">${esc(group.description || '')}</p>
+                </div>
+                <div class="form-grid">
+                  ${group.parameters.map(renderParamField).join('')}
+                </div>
+              </div>
+            `
+            )
+            .join('')}
+
+          <div class="form-footer" style="margin-top:20px">
+            <button type="button" class="button secondary small-btn" id="resetWorkshopSettingsBtn">Restaurar valores por defecto</button>
+            <button type="submit" class="button primary" id="saveWorkshopSettingsBtn">Guardar configuración</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  `
+
+  document.getElementById('backFromSettingsBtn')?.addEventListener('click', () => {
+    goBackAppRoute({ name: 'jobs' })
+  })
+
+  document.getElementById('navChangePassBtn')?.addEventListener('click', () => {
+    navigateAppRoute({ name: 'password' })
+  })
+
+  document.getElementById('settingsPasswordForm')?.addEventListener('submit', async e => {
+    e.preventDefault()
+    const btn = document.getElementById('settingsUpdatePassBtn')
+    const newPass = document.getElementById('settingsNewPassword')?.value
+    const confirmPass = document.getElementById('settingsConfirmPassword')?.value
+    setSettingsAlert('', '')
+    if (btn) {
+      btn.disabled = true
+      btn.textContent = 'Actualizando contraseña…'
+    }
+    try {
+      await updateUserPassword(newPass, confirmPass)
+      const newInput = document.getElementById('settingsNewPassword')
+      const confirmInput = document.getElementById('settingsConfirmPassword')
+      if (newInput) newInput.value = ''
+      if (confirmInput) confirmInput.value = ''
+      setSettingsAlert('success', 'Contraseña actualizada con éxito.')
+      window.toast?.('Contraseña actualizada con éxito.')
+    } catch (err) {
+      setSettingsAlert('error', err.message || 'No se pudo actualizar la contraseña.')
+    } finally {
+      if (btn) {
+        btn.disabled = false
+        btn.textContent = 'Guardar nueva contraseña'
+      }
+    }
+  })
+
+  document.getElementById('workshopSettingsForm')?.addEventListener('submit', e => {
+    e.preventDefault()
+    setSettingsAlert('', '')
+    const rawValues = {}
+    settingsScreen.querySelectorAll('[data-setting-key]').forEach(input => {
+      const key = input.getAttribute('data-setting-key')
+      rawValues[key] = input.type === 'checkbox' ? input.checked : input.value
+    })
+    const result = saveWorkshopSettings(workshopId, rawValues)
+    if (!result.valid) {
+      setSettingsAlert('error', result.error || 'Revisá los parámetros ingresados.')
+      return
+    }
+    appAuthState.workshopSettings = result.values
+    setSettingsAlert('success', 'Parámetros de configuración guardados correctamente.')
+    window.toast?.('Configuración guardada.')
+  })
+
+  document.getElementById('resetWorkshopSettingsBtn')?.addEventListener('click', () => {
+    const result = saveWorkshopSettings(workshopId, DEFAULT_WORKSHOP_SETTINGS)
+    appAuthState.workshopSettings = result.values
+    renderSettingsScreen().then(() => {
+      setSettingsAlert('info', 'Se restauraron los parámetros predeterminados del taller.')
+    })
+  })
+
+  document.getElementById('settingsExportBackupBtn')?.addEventListener('click', () => {
+    window.exportBackup?.()
+  })
+
+  document.getElementById('settingsImportBackupInput')?.addEventListener('change', e => {
+    const file = e.target.files?.[0]
+    if (file && document.getElementById('importBackup')) {
+      const dt = new DataTransfer()
+      dt.items.add(file)
+      const legacyInput = document.getElementById('importBackup')
+      legacyInput.files = dt.files
+      legacyInput.dispatchEvent(new Event('change'))
+    }
+    e.target.value = ''
+  })
+}
+
 async function handleExpiredSession() {
   privateReadCache.clear()
   appAuthState.session = null
@@ -3067,6 +3619,7 @@ async function initializeAuthenticatedSession(session) {
     }
 
     privateReadCache.activate({ userId, workshopId: getActiveMembership()?.workshop_id })
+    appAuthState.workshopSettings = getWorkshopSettings(getActiveMembership()?.workshop_id)
     await syncActiveWorkshopToLegacyStore({ useMembership: true })
     await loadWorkshopJobsFromSupabase()
     if (appAuthState.user?.id !== userId) return
@@ -3078,17 +3631,62 @@ async function initializeAuthenticatedSession(session) {
   await enforceRouteProtection()
 }
 
-function setBudgetDeliveryFeedback(type, message) {
+function setBudgetDeliveryFeedback(type, message, section = 'budget') {
+  const box = document.getElementById('budgetDeliveryFeedback')
+  if (!message) {
+    if (box) {
+      box.hidden = true
+      box.textContent = ''
+    }
+    return
+  }
+  if (box) {
+    box.className = `auth-alert ${type || 'info'}`
+    box.textContent = message
+    box.hidden = false
+  }
+  if (type === 'error') {
+    showErrorModal({ message, section })
+  }
+}
+
+function renderWhatsappDeliveryFeedback(type, message, url) {
   const box = document.getElementById('budgetDeliveryFeedback')
   if (!box) return
   if (!message) {
     box.hidden = true
-    box.textContent = ''
+    box.replaceChildren()
     return
   }
   box.className = `auth-alert ${type || 'info'}`
-  box.textContent = message
+  box.innerHTML = `
+    <div class="pdf-feedback-message">${esc(message)}</div>
+    ${url ? `<div class="pdf-actions-bar"><a href="${esc(url)}" target="_blank" rel="noopener noreferrer" class="button whatsapp small-btn" id="openWhatsappDirectLink">💬 Abrir WhatsApp ahora</a></div>` : ''}
+  `
   box.hidden = false
+}
+
+function renderBudgetPdfActionsFeedback(type, message) {
+  const box = document.getElementById('budgetDeliveryFeedback')
+  if (!box) return
+  if (!message) {
+    box.hidden = true
+    box.replaceChildren()
+    return
+  }
+  box.className = `auth-alert ${type || 'info'}`
+  box.innerHTML = `
+    <div class="pdf-feedback-message">${esc(message)}</div>
+    <div class="pdf-actions-bar">
+      <button type="button" class="button secondary small-btn" id="printBudgetA4Btn">🖨 Imprimir A4</button>
+      <button type="button" class="button whatsapp small-btn" id="shareBudgetPdfBtn">📤 Compartir PDF</button>
+      <button type="button" class="button secondary small-btn" id="repeatDownloadPdfBtn">⬇ Descargar PDF nuevamente</button>
+    </div>
+  `
+  box.hidden = false
+  box.querySelector('#printBudgetA4Btn')?.addEventListener('click', () => window.printBudget?.())
+  box.querySelector('#shareBudgetPdfBtn')?.addEventListener('click', () => window.shareBudgetPdfAction?.())
+  box.querySelector('#repeatDownloadPdfBtn')?.addEventListener('click', () => window.downloadBudgetPdfAction?.())
 }
 
 function getCurrentWorkshopForBudget() {
@@ -3096,6 +3694,128 @@ function getCurrentWorkshopForBudget() {
     ...(window.store?.shop || {}),
     ...(appAuthState.activeWorkshopProfile || {})
   }
+}
+
+function syncActiveJobFromDom() {
+  const j = window.active
+  if (!j) return null
+  if (!j.rec) j.rec = {}
+  document.querySelectorAll('#receptionForm [data-rec]').forEach(el => {
+    const field = el.dataset.rec
+    if (!field) return
+    const val = el.value ?? ''
+    if (String(val).trim() !== '' || !j.rec[field]) {
+      j.rec[field] = field === 'patente' ? String(val).toUpperCase().trim() : val
+    }
+  })
+
+  if (!Array.isArray(j.quote)) j.quote = []
+  if (!j.pieceQuotes || typeof j.pieceQuotes !== 'object' || Array.isArray(j.pieceQuotes)) {
+    j.pieceQuotes = {}
+  }
+  const lineEls = document.querySelectorAll('#quoteLines [data-line][data-field]')
+  lineEls.forEach(el => {
+    const idx = Number(el.dataset.line)
+    const field = el.dataset.field
+    const line = j.quote[idx]
+    if (!line || !field) return
+    if (field === 'description') {
+      line.description = el.value ?? ''
+    } else if (field === 'qty' || field === 'price') {
+      line[field] = Math.max(0, Number(el.value) || 0)
+    } else {
+      line[field] = el.value
+    }
+    if (line.sourceKey) {
+      j.pieceQuotes[line.sourceKey] = {
+        ...(j.pieceQuotes[line.sourceKey] || {}),
+        qty: Math.max(0, Number(line.qty) || 0),
+        price: Math.max(0, Number(line.price) || 0),
+        unit: line.unit,
+        workType: line.workType,
+        workLabel: line.workLabel,
+        pieceKey: line.pieceKey,
+        pieceName: line.pieceName,
+        zoneName: line.zoneName,
+        description: line.description
+      }
+    }
+  })
+
+  // Si existen renglones válidos con descripción y cantidad > 0, eliminar renglones extra en blanco que bloqueen la entrega
+  const validLines = j.quote.filter(q => String(q?.description || '').trim() && (Number(q?.qty) || 0) > 0)
+  if (validLines.length > 0 && validLines.length < j.quote.length) {
+    j.quote = j.quote.filter(q => String(q?.description || '').trim() || (Number(q?.price) || 0) > 0)
+    window.renderBudget?.()
+  }
+
+  if (!j.document) j.document = {}
+  const termsEl = document.getElementById('terms')
+  if (termsEl && termsEl.value) j.document.terms = termsEl.value
+  const discountEl = document.getElementById('discount')
+  if (discountEl && discountEl.value !== '') j.discount = Math.max(0, Number(discountEl.value) || 0)
+  const taxEl = document.getElementById('tax')
+  if (taxEl && taxEl.value !== '') j.tax = Math.max(0, Number(taxEl.value) || 0)
+  const quoteDateEl = document.getElementById('quoteDate')
+  if (quoteDateEl && quoteDateEl.value) j.document.date = quoteDateEl.value
+  const validDaysEl = document.getElementById('validDays')
+  if (validDaysEl && validDaysEl.value !== '') j.document.validDays = Math.max(1, Number(validDaysEl.value) || 15)
+
+  return j
+}
+
+function validateBudgetBeforeAction() {
+  const j = syncActiveJobFromDom()
+  if (!j) {
+    const msg = 'No hay un trabajo activo seleccionado. Volvé a Trabajos y abrí un presupuesto.'
+    setBudgetDeliveryFeedback('error', msg)
+    window.notify?.(msg, 'error')
+    window.toast?.(msg)
+    return false
+  }
+
+  const valid = Boolean(window.quoteValid?.())
+  if (!valid) {
+    const noticeEl = document.getElementById('notice')
+    let reason = (!noticeEl?.hidden && noticeEl?.textContent?.trim()) || ''
+    if (!reason) {
+      if (!String(j.rec?.cliente || '').trim()) {
+        reason = 'Completá el nombre del cliente en el Paso 1 (Recepción) antes de entregar el presupuesto.'
+      } else if (!String(j.rec?.patente || '').trim()) {
+        reason = 'Completá la patente del vehículo en el Paso 1 (Recepción) antes de entregar el presupuesto.'
+      } else if (!Array.isArray(j.quote) || !j.quote.length) {
+        reason = 'Agregá al menos un trabajo o repuesto al presupuesto antes de descargarlo o enviarlo.'
+      } else if (j.quote.some(q => !String(q?.description || '').trim() || !(Number(q?.qty) > 0))) {
+        reason = 'Cada renglón del presupuesto necesita una descripción y una cantidad mayor a 0.'
+      } else {
+        reason = 'Se canceló la entrega porque hay renglones con precio $ 0. Completá el precio unitario o confirmá la entrega.'
+      }
+    }
+    const emptyDescInput = Array.from(document.querySelectorAll('#quoteLines input[data-field="description"]')).find(
+      el => !String(el.value || '').trim()
+    )
+    const invalidQtyInput = Array.from(document.querySelectorAll('#quoteLines input[data-field="qty"]')).find(
+      el => !(Number(el.value) > 0)
+    )
+    if (emptyDescInput) {
+      markFieldError(emptyDescInput, 'Ingresá la descripción del trabajo o repuesto.')
+    }
+    if (invalidQtyInput) {
+      markFieldError(invalidQtyInput, 'Ingresá una cantidad mayor a 0.')
+    }
+
+    const section = !String(j.rec?.cliente || '').trim() || !String(j.rec?.patente || '').trim() ? 'reception' : 'budget'
+    setBudgetDeliveryFeedback('error', reason, section)
+    if (noticeEl) {
+      noticeEl.className = 'notice error'
+      noticeEl.textContent = reason
+      noticeEl.hidden = false
+    }
+    window.toast?.(reason)
+    return false
+  }
+
+  return true
 }
 
 function restorePieceDomStateAfterRender() {
@@ -3129,8 +3849,46 @@ function restorePieceDomStateAfterRender() {
 }
 
 export function wireNavigationPersistence() {
+  window.goBackFromWork = function () {
+    if (appAuthState.user) return goBackAppRoute({ name: 'jobs' })
+    return window.showJobs?.()
+  }
+  const backWorkBtn = document.getElementById('backFromWorkBtn')
+  if (backWorkBtn) backWorkBtn.textContent = '← Volver'
+
   if (window.__navPersistenceWrapped) return
   window.__navPersistenceWrapped = true
+
+  const origNewJob = window.newJob
+  if (typeof origNewJob === 'function') {
+    window.newJob = function (rec) {
+      const existingIds = new Set((window.store?.jobs || []).map(j => j.id))
+      const res = origNewJob.call(this, rec)
+      const created = window.active
+      if (created && !existingIds.has(created.id)) {
+        const wsId = getActiveMembership()?.workshop_id || appAuthState.activeWorkshopId || 'default'
+        const cfg = getWorkshopSettings(wsId)
+        appAuthState.workshopSettings = cfg
+        if (!rec?.tipo && cfg.defaultVehicleType) created.rec.tipo = cfg.defaultVehicleType
+        if (cfg.defaultTaxPct !== undefined && !created.tax) created.tax = Number(cfg.defaultTaxPct) || 0
+        if (created.document) {
+          if (cfg.defaultValidDays) created.document.validDays = Number(cfg.defaultValidDays) || 15
+          if (cfg.defaultTerms && !created.document.terms) created.document.terms = cfg.defaultTerms
+        }
+        window.fillReception?.()
+        window.saveLocal?.(false)
+      }
+      return res
+    }
+  }
+
+  const origRenderBudget = window.renderBudget
+  if (typeof origRenderBudget === 'function') {
+    window.renderBudget = function (...args) {
+      prepareBudgetDelivery().catch(() => {})
+      return origRenderBudget.apply(this, args)
+    }
+  }
 
   const origShowJobs = window.showJobs
   if (typeof origShowJobs === 'function') {
@@ -3144,23 +3902,36 @@ export function wireNavigationPersistence() {
 
   const origOpenJob = window.openJob
   if (typeof origOpenJob === 'function') {
-    window.openJob = function (id, step = 'reception') {
+    window.openJob = function (id, step) {
+      prepareBudgetDelivery().catch(() => {})
+      const target = window.store?.jobs?.find(job => job.id === id)
+      const resolvedStep =
+        step ||
+        (target?.quote?.length
+          ? 'budget'
+          : target?.inspection && Object.keys(target.inspection).length
+            ? 'inspection'
+            : 'reception')
       if (!routeRenderingDepth && appAuthState.user) {
-        const target = window.store?.jobs?.find(job => job.id === id)
         if (!target) return
         const snapshot = buildNavigationSnapshot({
           userId: appAuthState.user.id, workshopId: getActiveMembership()?.workshop_id,
-          screen: 'work', activeJobId: id, step, area: target.area
+          screen: 'work', activeJobId: id, step: resolvedStep, area: target.area
         })
-        return navigateAppRoute({ name: 'work', jobId: id, step }, { snapshot })
+        return navigateAppRoute({ name: 'work', jobId: id, step: resolvedStep }, { snapshot })
       }
       appAuthState.activePieceKey = null
       appAuthState.openPieceDetailsKeys = []
-      const res = origOpenJob.call(this, id, step)
+      const res = origOpenJob.call(this, id, resolvedStep)
+      const workScreenEl = document.getElementById('workScreen')
+      if (workScreenEl) {
+        workScreenEl.dataset.renderedJobId = String(id || window.active?.id || '')
+        workScreenEl.dataset.renderedStep = String(window.step || resolvedStep || 'reception')
+      }
       persistCurrentNavigationState({
         screen: 'work',
         activeJobId: id || window.active?.id || null,
-        step: window.step || step || 'reception',
+        step: window.step || resolvedStep || 'reception',
         area: window.active?.area || 'Parte delantera',
         page: Number(window.page || 0),
         activePieceKey: null,
@@ -3176,12 +3947,32 @@ export function wireNavigationPersistence() {
       if (!routeRenderingDepth) persistCurrentNavigationState()
       const res = origShowStep.call(this, next, validate)
       if (window.step === 'budget') prepareBudgetDelivery().catch(() => {})
+      const workScreenEl = document.getElementById('workScreen')
+      if (workScreenEl && window.active) {
+        workScreenEl.dataset.renderedJobId = String(window.active.id || '')
+        workScreenEl.dataset.renderedStep = String(window.step || next || 'reception')
+      }
       const snapshot = persistCurrentNavigationState({
         screen: 'work',
         step: window.step || next
       }, { capture: Boolean(routeRenderingDepth) })
       if (!routeRenderingDepth && window.active && window.step === next) {
-        navigateAppRoute({ name: 'work', jobId: window.active.id, step: next }, { snapshot, captureDeparture: false })
+        const noticeEl = document.getElementById('notice')
+        const preservedNotice = !noticeEl?.hidden && noticeEl?.textContent
+          ? { text: noticeEl.textContent, className: noticeEl.className, validation: noticeEl.dataset?.validation || '' }
+          : null
+        const navPromise = navigateAppRoute({ name: 'work', jobId: window.active.id, step: next }, { snapshot, captureDeparture: false })
+        if (preservedNotice && navPromise && typeof navPromise.then === 'function') {
+          navPromise.then(() => {
+            if (noticeEl) {
+              noticeEl.className = preservedNotice.className
+              noticeEl.textContent = preservedNotice.text
+              if (preservedNotice.validation) noticeEl.dataset.validation = preservedNotice.validation
+              noticeEl.hidden = false
+            }
+            showErrorModal({ message: preservedNotice.text, section: preservedNotice.validation || 'jobs' })
+          }).catch(() => {})
+        }
       }
       return res
     }
@@ -3275,95 +4066,124 @@ export function wireNavigationPersistence() {
   )
 }
 
-function wireEnhancedBudgetAndSettings() {
+export function wireEnhancedBudgetAndSettings() {
   wireNavigationPersistence()
 
-  // DEV-25: Opción A — Compartir presupuesto como mensaje de texto por WhatsApp (sin afirmar que fue enviado si solo se abrió WhatsApp)
+  // DEV-25 / DEV-32: Opción A — Compartir presupuesto como mensaje de texto por WhatsApp (sin afirmar que fue enviado si solo se abrió WhatsApp)
   if (!window.__dev25WhatsappWrapped) {
     window.__dev25WhatsappWrapped = true
     window.shareWhatsapp = function () {
-      if (!window.quoteValid?.()) return
+      if (!validateBudgetBeforeAction()) return null
       const j = window.active
-      if (!j) return
+      if (!j) return null
       const shop = getCurrentWorkshopForBudget()
       j.document.shop = JSON.parse(JSON.stringify(shop))
       window.saveLocal?.()
 
       try {
         const res = openWhatsappWithBudgetText(j, shop, window)
-        setBudgetDeliveryFeedback('info', res.userMessage)
+        renderWhatsappDeliveryFeedback('info', res.userMessage, res.url)
         window.toast?.(res.userMessage)
+        return res
       } catch (err) {
-        setBudgetDeliveryFeedback('error', err.message || 'No se pudo preparar el mensaje de WhatsApp.')
+        const errMsg = err.message || 'No se pudo preparar el mensaje de WhatsApp.'
+        setBudgetDeliveryFeedback('error', errMsg, 'whatsapp')
+        window.toast?.(errMsg)
+        return null
       }
     }
 
-    // DEV-25: Opción B.1 — Generar y descargar archivo PDF real (.pdf) con logo, CUIT, taller, cliente, vehículo, trabajos y total
+    // DEV-32 / DEV-25: Botón único «Descargar / Imprimir» — Genera y descarga el PDF oficial verificado y habilita acciones de Impresión A4 y Compartir PDF
     window.downloadBudgetPdfAction = async function () {
-      if (!window.quoteValid?.()) return
+      if (!validateBudgetBeforeAction()) return null
       const j = window.active
-      if (!j) return
+      if (!j) return null
       const shop = getCurrentWorkshopForBudget()
       j.document.shop = JSON.parse(JSON.stringify(shop))
       window.saveLocal?.()
 
       try {
-        const module = await prepareBudgetDelivery()
+        const module = budgetDeliveryModule || (await prepareBudgetDelivery())
         const res = module.downloadBudgetPdf(j, shop, document)
-        setBudgetDeliveryFeedback('success', res.userMessage)
+        renderBudgetPdfActionsFeedback('success', res.userMessage)
         window.toast?.(res.userMessage)
+        return res
       } catch (err) {
-        setBudgetDeliveryFeedback('error', err.message || 'No se pudo generar el archivo PDF.')
+        const errMsg = err.message || 'No se pudo generar ni descargar el archivo PDF.'
+        setBudgetDeliveryFeedback('error', errMsg, 'pdf')
+        window.toast?.(errMsg)
+        return null
       }
     }
 
-    // DEV-25: Opción B.2 — Compartir el archivo PDF mediante las opciones compatibles del dispositivo (Web Share API o descarga + apertura de WhatsApp)
+    // DEV-32 / DEV-25: Compartir el archivo PDF mediante Web Share API (Android/PWA/móvil) o fallback explícito en escritorio sin afirmar envío no confirmado
     window.shareBudgetPdfAction = async function () {
-      if (!window.quoteValid?.()) return
+      if (!validateBudgetBeforeAction()) return null
       const j = window.active
-      if (!j) return
+      if (!j) return null
       const shop = getCurrentWorkshopForBudget()
       j.document.shop = JSON.parse(JSON.stringify(shop))
       window.saveLocal?.()
 
       try {
-        if (!budgetDeliveryModule) {
-          await prepareBudgetDelivery()
-          setBudgetDeliveryFeedback('info', 'PDF preparado. Tocá Compartir PDF para elegir la aplicación.')
-          return
-        }
-        const res = await budgetDeliveryModule.shareBudgetPdf(j, shop, {
+        const module = budgetDeliveryModule || (await prepareBudgetDelivery())
+        const res = await module.shareBudgetPdf(j, shop, {
           navigatorObj: window.navigator,
           windowObj: window,
           documentObj: document
         })
-        setBudgetDeliveryFeedback('info', res.userMessage)
+        renderBudgetPdfActionsFeedback('info', res.userMessage)
         window.toast?.(res.userMessage)
+        return res
       } catch (err) {
-        setBudgetDeliveryFeedback('error', err.message || 'No se pudo compartir el archivo PDF.')
+        const errMsg = err.message || 'No se pudo compartir el archivo PDF.'
+        setBudgetDeliveryFeedback('error', errMsg, 'pdf')
+        window.toast?.(errMsg)
+        return null
       }
     }
   }
 
+  const downloadPdfBtn = document.getElementById('downloadBudgetPdfBtn')
+  if (downloadPdfBtn) {
+    downloadPdfBtn.disabled = false
+    downloadPdfBtn.onclick = e => {
+      e?.preventDefault?.()
+      return window.downloadBudgetPdfAction?.()
+    }
+  }
+
+  const shareWhatsappBtn = document.getElementById('shareWhatsappTextBtn')
+  if (shareWhatsappBtn) {
+    shareWhatsappBtn.disabled = false
+    shareWhatsappBtn.onclick = e => {
+      e?.preventDefault?.()
+      return window.shareWhatsapp?.()
+    }
+  }
+
   // DEV-19: Conectar la emisión de PDF / Impresión A4 para que use automáticamente todos los datos y el logo del taller desde Supabase
-  if (typeof window.printBudget === 'function' && !window.__dev19PrintWrapped) {
+  if (!window.__dev19PrintWrapped) {
     window.__dev19PrintWrapped = true
     window.printBudget = function () {
-      if (!window.quoteValid?.()) return
+      if (!validateBudgetBeforeAction()) return
       const j = window.active
       if (!j) return
       const shop = { ...(window.store?.shop || {}), ...(appAuthState.activeWorkshopProfile || {}) }
       j.document.shop = JSON.parse(JSON.stringify(shop))
       window.saveLocal?.()
 
-      const t = window.totals(j)
-      const d = j.document
+      const safeDateFn = typeof window.safeDate === 'function' ? window.safeDate : v => String(v || '')
+      const expiryFn = typeof window.expiry === 'function' ? window.expiry : dObj => String(dObj?.date || '')
+      const moneyFn = typeof window.money === 'function' ? window.money : v => `$ ${Number(v || 0)}`
+      const t = computeDetailedBudgetTotals(j)
+      const d = j.document || {}
       const quoteRef = j.number?.startsWith('LOCAL-') ? `Referencia ${j.id.slice(0, 8)}` : j.number
       const headerHtml = buildBudgetWorkshopHeaderHtml(
         shop,
         quoteRef,
-        window.safeDate(d.date),
-        window.safeDate(window.expiry(d))
+        safeDateFn(d.date),
+        safeDateFn(expiryFn(d))
       )
 
       const printDoc = document.getElementById('printDocument')
@@ -3386,24 +4206,27 @@ function wireEnhancedBudgetAndSettings() {
           </div>
           <table class="pdf-table">
             <thead>
-              <tr><th>Trabajo o repuesto</th><th>Cant.</th><th>Precio unit.</th><th>Importe</th></tr>
+              <tr><th>Pieza / Intervención</th><th>Cant. / Unid.</th><th>Precio unit.</th><th>Subtotal</th></tr>
             </thead>
             <tbody>
-              ${j.quote
-                .map(
-                  q =>
-                    `<tr><td>${esc(q.description)}</td><td>${Number(q.qty) || 0}</td><td>${window.money(
-                      q.price
-                    )}</td><td>${window.money((Number(q.qty) || 0) * (Number(q.price) || 0))}</td></tr>`
-                )
+              ${(j.quote || [])
+                .map(q => {
+                  const info = describeQuoteLine(q)
+                  return `<tr><td>${esc(info.displayDescription)}</td><td>${esc(info.qtyWithUnit)}</td><td>${moneyFn(
+                    info.price
+                  )}</td><td>${moneyFn(info.subtotal)}</td></tr>`
+                })
                 .join('')}
             </tbody>
           </table>
           <div class="pdf-total">
-            <div><span>Subtotal</span><b>${window.money(t.subtotal)}</b></div>
-            ${t.discount ? `<div><span>Descuento</span><b>- ${window.money(t.discount)}</b></div>` : ''}
-            ${t.tax ? `<div><span>Impuesto</span><b>${window.money(t.tax)}</b></div>` : ''}
-            <div class="pdf-grand"><span>Total</span><b>${window.money(t.total)}</b></div>
+            ${t.chapaCount > 0 || t.chapaSubtotal > 0 ? `<div><span>Resumen Chapa (${t.chapaDays} días)</span><b>${moneyFn(t.chapaSubtotal)}</b></div>` : ''}
+            ${t.pinturaCount > 0 || t.pinturaSubtotal > 0 ? `<div><span>Resumen Pintura (${t.pinturaPanels} paños)</span><b>${moneyFn(t.pinturaSubtotal)}</b></div>` : ''}
+            ${t.otherSubtotal > 0 && (t.chapaCount > 0 || t.pinturaCount > 0) ? `<div><span>Otros trabajos / repuestos</span><b>${moneyFn(t.otherSubtotal)}</b></div>` : ''}
+            <div><span>Subtotal</span><b>${moneyFn(t.subtotal)}</b></div>
+            ${t.discount ? `<div><span>Descuento</span><b>- ${moneyFn(t.discount)}</b></div>` : ''}
+            ${t.tax ? `<div><span>Impuesto</span><b>${moneyFn(t.tax)}</b></div>` : ''}
+            <div class="pdf-grand"><span>Total</span><b>${moneyFn(t.total)}</b></div>
           </div>
           ${d.terms ? `<div class="pdf-terms"><b>Condiciones y observaciones</b><p>${esc(d.terms)}</p></div>` : ''}
           <p class="pdf-footer">
@@ -3431,10 +4254,10 @@ function wireEnhancedBudgetAndSettings() {
     }
   }
 
-  // Conectar el botón ⚙ del header para abrir directamente el Perfil Completo del Taller (DEV-19)
+  // DEV-33: Conectar Configuración para abrir la sección dedicada (#/configuracion)
   window.openSettings = function () {
-    if (appAuthState.user && getActiveMembership()) {
-      openProfileScreen()
+    if (appAuthState.user) {
+      openSettingsScreen()
     }
   }
 }

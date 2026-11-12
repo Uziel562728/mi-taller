@@ -17,7 +17,7 @@ function retireDevelopmentWorker() {
         response.setHeader('Cache-Control', 'no-store')
         // Retire an old registration even when its page still has old code.
         // Production builds continue to copy the real offline worker.
-        response.end("self.addEventListener('install', () => self.skipWaiting()); self.addEventListener('activate', event => event.waitUntil(self.registration.unregister()));")
+        response.end("self.addEventListener('install', () => self.skipWaiting()); self.addEventListener('activate', event => event.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k.startsWith('crash-solution-shell-')).map(k => caches.delete(k)))).then(() => self.registration.unregister())));")
       })
     }
   }
