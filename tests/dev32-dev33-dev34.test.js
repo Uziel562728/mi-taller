@@ -40,7 +40,17 @@ import {
   renderConflictResolutionNotice,
   syncBudgetFromInspection,
   computeDetailedBudgetTotals,
-  describeQuoteLine
+  describeQuoteLine,
+  resolveBudgetMode,
+  normalizeSummaryBudget,
+  computeSummaryBudgetTotals,
+  computeBudgetTotalsByMode,
+  checkBudgetModesConsistency,
+  normalizePaintType,
+  resolvePaintType,
+  resolveBudgetObservations,
+  buildSummaryPresentationLines,
+  formatArQuantity
 } from '../Crash_Solution_Publicacion/src/main.js'
 import { buildBudgetWhatsappMessage } from '../Crash_Solution_Publicacion/src/lib/budget-messages.js'
 import {
@@ -687,7 +697,8 @@ describe('ETAPA 2 — DEV-33: Navegación con «Volver», «Mi taller», Diseño
     expect(settingsScreen.hidden).toBe(false)
     expect(settingsScreen.querySelector('h1')?.textContent).toBe('Configuración')
     expect(settingsScreen.querySelector('#settingsPasswordForm')).not.toBeNull()
-    expect(settingsScreen.querySelector('#navChangePassBtn')).not.toBeNull()
+    expect(settingsScreen.querySelector('#navChangePassBtn')).toBeNull()
+    expect(settingsScreen.textContent).not.toContain('Cambiar contraseña en vista dedicada')
 
     // Cambiar contraseña directamente desde Configuración
     document.getElementById('settingsNewPassword').value = 'NuevaClaveTaller2026!'
@@ -1462,11 +1473,11 @@ describe('DEV-35 — Presupuesto generado desde la Inspección por Pieza e Inter
 
     // Verificar mensaje de WhatsApp
     const waText = buildBudgetWhatsappMessage(job, shop)
-    expect(waText).toContain('Puerta delantera derecha · Chapa (2.5 días x $ 44.000,00): $ 110.000,00')
-    expect(waText).toContain('Puerta delantera derecha · Pintura (1.5 paños x $ 80.000,00): $ 120.000,00')
+    expect(waText).toContain('Puerta delantera derecha · Chapa (2,5 días x $ 44.000,00): $ 110.000,00')
+    expect(waText).toContain('Puerta delantera derecha · Pintura (1,5 paños x $ 80.000,00): $ 120.000,00')
     expect(waText).toContain('Capot · Pintura (2 paños x $ 85.000,00): $ 170.000,00')
-    expect(waText).toContain('Resumen Chapa (2.5 días): $ 110.000,00')
-    expect(waText).toContain('Resumen Pintura (3.5 paños): $ 290.000,00')
+    expect(waText).toContain('Resumen Chapa (2,5 días): $ 110.000,00')
+    expect(waText).toContain('Resumen Pintura (3,5 paños): $ 290.000,00')
     expect(waText).toContain('*TOTAL PRESUPUESTADO: $ 400.000,00*')
 
     // Verificar generación real de bytes PDF con desglose de días, paños y resúmenes
@@ -1480,13 +1491,13 @@ describe('DEV-35 — Presupuesto generado desde la Inspección por Pieza e Inter
     window.printBudget()
     const printHtml = document.getElementById('printDocument').innerHTML
     expect(printHtml).toContain('Puerta delantera derecha · Chapa')
-    expect(printHtml).toContain('2.5 días')
+    expect(printHtml).toContain('2,5 días')
     expect(printHtml).toContain('Puerta delantera derecha · Pintura')
-    expect(printHtml).toContain('1.5 paños')
+    expect(printHtml).toContain('1,5 paños')
     expect(printHtml).toContain('Capot · Pintura')
     expect(printHtml).toContain('2 paños')
-    expect(printHtml).toContain('Resumen Chapa (2.5 días)')
-    expect(printHtml).toContain('Resumen Pintura (3.5 paños)')
+    expect(printHtml).toContain('Resumen Chapa (2,5 días)')
+    expect(printHtml).toContain('Resumen Pintura (3,5 paños)')
   })
 
   it('5. INTEGRACIÓN DOM REAL: En el paso Presupuesto agrupa las piezas con sus campos de Días de chapa / Paños de pintura, actualiza subtotales por pieza y totales separados en vivo, y conserva todo al ir y volver de la Revisión', () => {
@@ -1603,7 +1614,7 @@ describe('DEV-35 — Presupuesto generado desde la Inspección por Pieza e Inter
       expect(doc.getElementById('chapaTotalAmount').textContent).toContain('130.000')
 
       expect(doc.getElementById('pinturaTotalRow').hidden).toBe(false)
-      expect(doc.getElementById('pinturaTotalLabel').textContent).toBe('Total Pintura (3.5 paños)')
+      expect(doc.getElementById('pinturaTotalLabel').textContent).toBe('Total Pintura (3,5 paños)')
       expect(doc.getElementById('pinturaTotalAmount').textContent).toContain('290.000')
 
       expect(doc.getElementById('grandTotal').textContent).toContain('420.000')
@@ -1624,3 +1635,398 @@ describe('DEV-35 — Presupuesto generado desde la Inspección por Pieza e Inter
     }
   })
 })
+
+describe('ÚLTIMAS MODIFICACIONES — Dos modos de presupuesto, Bicapa/Tricapa, Observaciones y Firma del Taller', () => {
+  it('1. Presupuestos históricos conservan automáticamente Modo B (detallado) sin alterar sus cálculos ni exigir selección previa', () => {
+    const legacyJob = {
+      id: 'hist-1',
+      rec: { cliente: 'Martín Fernández', patente: 'AB 482 KD', marca: 'Volkswagen', modelo: 'Gol Trend' },
+      quote: [
+        { piece: 'Puerta delantera derecha', workType: 'Chapa', unit: 'día', qty: 2, price: 45000 },
+        { piece: 'Puerta delantera derecha', workType: 'Pintura', unit: 'paño', qty: 1.5, price: 80000 }
+      ],
+      discountPct: 10,
+      taxPct: 21
+    }
+
+    expect(resolveBudgetMode(legacyJob)).toBe('detailed')
+    expect(resolvePaintType(legacyJob)).toBe('')
+    const detTotals = computeBudgetTotalsByMode(legacyJob)
+    expect(detTotals.mode).toBe('detailed')
+    expect(detTotals.chapaSubtotal).toBe(90000)
+    expect(detTotals.pinturaSubtotal).toBe(120000)
+    expect(detTotals.subtotal).toBe(210000)
+    expect(detTotals.discountAmount).toBe(21000)
+    expect(detTotals.taxAmount).toBe(39690)
+    expect(detTotals.grandTotal).toBe(228690)
+  })
+
+  it('2. Modo A (Totalizar al final) y Modo B (Detallado por ítem) calculan días, paños, repuestos, descuentos e impuestos de forma independiente sin perder datos ni inventar distribuciones por pieza', () => {
+    const job = {
+      id: 'dual-mode-job',
+      budgetMode: 'summary',
+      paintType: 'Bicapa',
+      rec: { cliente: 'Carolina Gómez', patente: 'AE 731 LM', marca: 'Toyota', modelo: 'Corolla', seguro: 'Federación Patronal' },
+      inspection: {
+        'Lado derecho|||Puerta delantera derecha': { status: 'danado', works: ['Chapa', 'Pintura'], note: '', photos: [] },
+        'Parte delantera|||Paragolpes delantero': { status: 'danado', works: ['Pintura'], note: '', photos: [] }
+      },
+      quote: [],
+      pieceQuotes: {},
+      summaryBudget: {
+        chapaDays: 4,
+        chapaDayRate: 50000,
+        pinturaPanels: 3.5,
+        pinturaPanelRate: 80000
+      },
+      discountPct: 5,
+      taxPct: 21,
+      document: {
+        date: '2026-11-16',
+        validDays: 15,
+        paintType: 'Bicapa',
+        terms: 'Incluye cabina presurizada y pulido final.',
+        observations: 'Incluye cabina presurizada y pulido final.'
+      }
+    }
+
+    syncBudgetFromInspection(job)
+    // Agregamos además un repuesto/trabajo adicional manual
+    job.quote.push({
+      id: 'manual-optica',
+      source: 'manual',
+      pieceKey: null,
+      piece: 'Óptica delantera derecha',
+      workType: 'Repuesto',
+      unit: 'unidad',
+      qty: 1,
+      price: 120000
+    })
+
+    // Verificar cálculos en Modo A (Resumido):
+    // Chapa: 4 × 50.000 = 200.000
+    // Pintura: 3.5 × 80.000 = 280.000
+    // Repuesto manual: 1 × 120.000 = 120.000
+    // Subtotal = 600.000 | Desc 5% = 30.000 | Base = 570.000 | IVA 21% = 119.700 | Total = 689.700
+    const sumTotals = computeBudgetTotalsByMode(job, 'summary')
+    expect(sumTotals.mode).toBe('summary')
+    expect(sumTotals.chapaDays).toBe(4)
+    expect(sumTotals.chapaSubtotal).toBe(200000)
+    expect(sumTotals.pinturaPanels).toBe(3.5)
+    expect(sumTotals.pinturaSubtotal).toBe(280000)
+    expect(sumTotals.otherSubtotal).toBe(120000)
+    expect(sumTotals.subtotal).toBe(600000)
+    expect(sumTotals.discountAmount).toBe(30000)
+    expect(sumTotals.taxAmount).toBe(119700)
+    expect(sumTotals.grandTotal).toBe(689700)
+
+    // Verificar que las líneas por pieza NO recibieron una distribución inventada
+    const pieceLines = job.quote.filter(l => l.pieceKey)
+    expect(pieceLines).toHaveLength(3)
+    pieceLines.forEach(l => {
+      expect(l.qty).toBe(0)
+      expect(l.price).toBe(0)
+    })
+
+    // Cambiar a Modo B y cargar cantidades detalladas por pieza
+    job.budgetMode = 'detailed'
+    pieceLines[0].qty = 2.5
+    pieceLines[0].price = 50000 // Puerta Chapa: 125.000
+    pieceLines[1].qty = 2
+    pieceLines[1].price = 80000 // Puerta Pintura: 160.000
+    pieceLines[2].qty = 1.5
+    pieceLines[2].price = 80000 // Paragolpes Pintura: 120.000
+
+    const detTotals = computeBudgetTotalsByMode(job, 'detailed')
+    expect(detTotals.mode).toBe('detailed')
+    expect(detTotals.chapaDays).toBe(2.5)
+    expect(detTotals.chapaSubtotal).toBe(125000)
+    expect(detTotals.pinturaPanels).toBe(3.5)
+    expect(detTotals.pinturaSubtotal).toBe(280000)
+    expect(detTotals.otherSubtotal).toBe(120000)
+    expect(detTotals.subtotal).toBe(525000)
+
+    // Al tener totales distintos entre Modo A (600.000) y Modo B (525.000), checkBudgetModesConsistency lo detecta sin mezclar silenciosamente
+    const consistencyDiff = checkBudgetModesConsistency(job)
+    expect(consistencyDiff.hasBothModesData).toBe(true)
+    expect(consistencyDiff.consistent).toBe(false)
+
+    // Si en Modo B la chapa suma también 4 días (ej. 4 días × $50.000), ambos modos coinciden y permite emitir ambas presentaciones
+    pieceLines[0].qty = 4
+    const consistencyMatch = checkBudgetModesConsistency(job)
+    expect(consistencyMatch.hasBothModesData).toBe(true)
+    expect(consistencyMatch.consistent).toBe(true)
+
+    // Volver a Modo A conserva intactos tanto summaryBudget como pieceLines
+    job.budgetMode = 'summary'
+    expect(job.summaryBudget.chapaDays).toBe(4)
+    expect(job.summaryBudget.pinturaPanels).toBe(3.5)
+    expect(pieceLines[0].qty).toBe(4)
+    expect(pieceLines[1].qty).toBe(2)
+  })
+
+  it('3. PDF, Impresión A4 y WhatsApp se adaptan a Modo A y Modo B, muestran Bicapa/Tricapa, Observaciones y el bloque de Firma del Taller emisor', async () => {
+    const job = {
+      id: 'pdf-wa-modes',
+      budgetMode: 'summary',
+      paintType: 'Tricapa',
+      rec: {
+        cliente: 'Diego Rodríguez',
+        telefono: '11 5555 0199',
+        patente: 'AF 264 PR',
+        marca: 'Peugeot',
+        modelo: '208',
+        anio: '2022',
+        seguro: 'Sancor Seguros'
+      },
+      inspection: {
+        'Parte trasera|||Portón trasero': { status: 'danado', works: ['Chapa', 'Pintura'], note: '', photos: [] }
+      },
+      quote: [
+        {
+          id: 'rep-1',
+          source: null,
+          pieceKey: null,
+          description: 'Insignia trasera e insumos de sellado',
+          workType: 'Repuesto',
+          unit: 'global',
+          qty: 1,
+          price: 45000
+        }
+      ],
+      summaryBudget: {
+        chapaDays: 3,
+        chapaDayPrice: 55000,
+        pinturaPanels: 2.5,
+        pinturaPanelPrice: 90000
+      },
+      discount: 0,
+      tax: 21,
+      document: {
+        date: '2026-11-16',
+        validDays: 15,
+        paintType: 'Tricapa',
+        terms: 'Sujeto a revisión tras desarme de paragolpes.',
+        observations: 'Sujeto a revisión tras desarme de paragolpes.'
+      }
+    }
+
+    const shop = {
+      name: 'Crash Solution',
+      legal_name: 'Crash Solution Demo SRL',
+      tax_id: '20-26223569-7',
+      phone: '011 4855-0100',
+      address: 'Av. Warnes 1450, CABA'
+    }
+
+    // 1. WhatsApp en Modo A (Resumido)
+    expect(formatArQuantity(2.5)).toBe('2,5')
+    expect(formatArQuantity(3)).toBe('3')
+    expect(formatArQuantity(1.25)).toBe('1,25')
+
+    const waSummary = buildBudgetWhatsappMessage(job, shop)
+    expect(waSummary).toContain('*Resumen de trabajos y repuestos:*')
+    expect(waSummary).toContain('*Tipo de pintura:* Tricapa')
+    expect(waSummary).toContain('Trabajo de chapa (Total días) (3 días x $ 55.000,00): $ 165.000,00')
+    expect(waSummary).toContain('Trabajo de pintura (Total paños) (2,5 paños x $ 90.000,00): $ 225.000,00')
+    expect(waSummary).toContain('Insignia trasera e insumos de sellado: $ 45.000,00')
+    expect(waSummary).toContain('Sujeto a revisión tras desarme de paragolpes.')
+
+    // 2. PDF en Modo A (Resumido)
+    const pdfSummaryBytes = await generateBudgetPdfBytes(job, shop)
+    const pdfCheckA = verifyPdfBytesIntegrity(pdfSummaryBytes)
+    expect(pdfCheckA.valid).toBe(true)
+
+    // 3. Vista de impresión A4 en Modo A con firma del taller
+    window.store.shop = shop
+    window.active = job
+    document.getElementById('terms').value = 'Sujeto a revisión tras desarme de paragolpes.'
+    window.print = vi.fn()
+    window.printBudget()
+    const printHtmlSummary = document.getElementById('printDocument').innerHTML
+    expect(printHtmlSummary).toContain('Trabajo de chapa (Total días)')
+    expect(printHtmlSummary).toContain('3 días')
+    expect(printHtmlSummary).toContain('Trabajo de pintura (Total paños)')
+    expect(printHtmlSummary).toContain('2,5 paños')
+    expect(printHtmlSummary).toContain('Tricapa')
+    expect(printHtmlSummary).toContain('Sujeto a revisión tras desarme de paragolpes.')
+    expect(printHtmlSummary).toContain('FIRMA Y SELLO DEL TALLER EMISOR')
+    expect(printHtmlSummary).toContain('Crash Solution Central')
+    expect(printHtmlSummary).toContain('Crash Solution S.R.L.')
+    expect(printHtmlSummary).not.toContain('Firma del cliente')
+
+    // 4. Cambiar a Modo B (Detallado) y verificar WhatsApp, PDF e Impresión A4
+    job.budgetMode = 'detailed'
+    syncBudgetFromInspection(job)
+    const pieceChapa = job.quote.find(l => l.pieceName === 'Portón trasero' && l.workType === 'Chapa')
+    const piecePintura = job.quote.find(l => l.pieceName === 'Portón trasero' && l.workType === 'Pintura')
+    pieceChapa.qty = 3
+    pieceChapa.price = 55000
+    piecePintura.qty = 2.5
+    piecePintura.price = 90000
+
+    const waDetailed = buildBudgetWhatsappMessage(job, shop)
+    expect(waDetailed).toContain('Portón trasero · Chapa (3 días x $ 55.000,00): $ 165.000,00')
+    expect(waDetailed).toContain('Portón trasero · Pintura (2,5 paños x $ 90.000,00): $ 225.000,00')
+    expect(waDetailed).toContain('*Tipo de pintura:* Tricapa')
+
+    const pdfDetailedBytes = await generateBudgetPdfBytes(job, shop)
+    expect(verifyPdfBytesIntegrity(pdfDetailedBytes).valid).toBe(true)
+
+    window.printBudget()
+    const printHtmlDetailed = document.getElementById('printDocument').innerHTML
+    expect(printHtmlDetailed).toContain('Portón trasero · Chapa')
+    expect(printHtmlDetailed).toContain('Portón trasero · Pintura')
+    expect(printHtmlDetailed).toContain('FIRMA Y SELLO DEL TALLER EMISOR')
+  })
+
+  it('4. INTEGRACIÓN DOM REAL: Permite alternar entre Modo A y Modo B, ingresar días/paños manuales, seleccionar Bicapa/Tricapa sin alterar precios y editar Observaciones', () => {
+    const html = readFileSync(resolve('Crash_Solution_Publicacion/index.html'), 'utf8')
+    const dom = new JSDOM(html, {
+      url: 'http://localhost:5173/',
+      runScripts: 'dangerously',
+      beforeParse(win) {
+        win.scrollTo = () => {}
+      }
+    })
+    const win = dom.window
+    const doc = win.document
+
+    try {
+      win.newJob({
+        cliente: 'Laura Martínez',
+        patente: 'AC 593 HT',
+        marca: 'Ford',
+        modelo: 'Ranger',
+        anio: '2019'
+      })
+
+      win.active.inspection['Lado izquierdo|||Puerta trasera izquierda'] = {
+        status: 'danado',
+        works: ['Chapa', 'Pintura'],
+        note: '',
+        photos: []
+      }
+
+      win.showStep('budget')
+
+      // Por defecto inicia en Modo B (Detallado) y sin tipo de pintura seleccionado automáticamente
+      expect(win.resolveBudgetMode(win.active)).toBe('detailed')
+      expect(win.resolvePaintType(win.active)).toBe('')
+      expect(doc.getElementById('paintType')).toBeNull()
+      const bicapaBtn = doc.getElementById('paintBicapaBtn')
+      const tricapaBtn = doc.getElementById('paintTricapaBtn')
+      expect(bicapaBtn).not.toBeNull()
+      expect(tricapaBtn).not.toBeNull()
+      expect(bicapaBtn.getAttribute('aria-pressed')).toBe('false')
+      expect(tricapaBtn.getAttribute('aria-pressed')).toBe('false')
+      expect(doc.getElementById('paintTypeTotalRow').hidden).toBe(true)
+      expect(doc.querySelectorAll('.piece-quote-group')).toHaveLength(1)
+
+      // Cargar valores en Modo B: 2 días × $45.000 = $90.000 y 1.5 paños × $80.000 = $120.000 (Total = $210.000)
+      const q0 = doc.querySelector('input[data-line="0"][data-field="qty"]')
+      const p0 = doc.querySelector('input[data-line="0"][data-field="price"]')
+      const q1 = doc.querySelector('input[data-line="1"][data-field="qty"]')
+      const p1 = doc.querySelector('input[data-line="1"][data-field="price"]')
+      q0.value = '2'; q0.dispatchEvent(new win.Event('input', { bubbles: true }))
+      p0.value = '45000'; p0.dispatchEvent(new win.Event('input', { bubbles: true }))
+      q1.value = '1.5'; q1.dispatchEvent(new win.Event('input', { bubbles: true }))
+      p1.value = '80000'; p1.dispatchEvent(new win.Event('input', { bubbles: true }))
+
+      expect(doc.getElementById('grandTotal').textContent).toContain('210.000')
+      expect(doc.getElementById('pinturaTotalLabel').textContent).toBe('Total Pintura (1,5 paños)')
+
+      // Cambiar a Modo A (Totalizar al final): no muestra las tarjetas individuales por pieza
+      win.setBudgetMode('summary')
+      expect(win.active.budgetMode).toBe('summary')
+      expect(doc.querySelectorAll('.piece-quote-group')).toHaveLength(0)
+      expect(doc.getElementById('summaryBudgetCard')).not.toBeNull()
+
+      // Ingresar días y paños manuales en Modo A: 5 días × $50.000 = $250.000 y 4 paños × $85.000 = $340.000 (Total = $590.000)
+      const sumChapaDays = doc.getElementById('summaryChapaDays')
+      const sumChapaRate = doc.getElementById('summaryChapaPrice')
+      const sumPinturaPanels = doc.getElementById('summaryPinturaPanels')
+      const sumPinturaRate = doc.getElementById('summaryPinturaPrice')
+
+      sumChapaDays.value = '5'; sumChapaDays.dispatchEvent(new win.Event('input', { bubbles: true }))
+      sumChapaRate.value = '50000'; sumChapaRate.dispatchEvent(new win.Event('input', { bubbles: true }))
+      sumPinturaPanels.value = '4'; sumPinturaPanels.dispatchEvent(new win.Event('input', { bubbles: true }))
+      sumPinturaRate.value = '85000'; sumPinturaRate.dispatchEvent(new win.Event('input', { bubbles: true }))
+
+      expect(doc.getElementById('summaryChapaSubtotal').textContent).toContain('250.000')
+      expect(doc.getElementById('summaryPinturaSubtotal').textContent).toContain('340.000')
+      expect(doc.getElementById('grandTotal').textContent).toContain('590.000')
+
+      // Verifica que el aviso de diferencia entre modos se muestre compacto y claro
+      const modeNotice = doc.getElementById('budgetModeConsistencyNotice')
+      expect(modeNotice.hidden).toBe(false)
+      expect(modeNotice.classList.contains('budget-mode-notice')).toBe(true)
+      expect(modeNotice.textContent).toContain('Totales distintos entre modos:')
+      expect(modeNotice.textContent).toContain('Resumido')
+      expect(modeNotice.textContent).toContain('Detallado')
+
+      // Seleccionar Bicapa y luego Tricapa únicamente desde los botones: persiste y no altera ningún precio
+      bicapaBtn.click()
+      expect(win.active.paintType).toBe('Bicapa')
+      expect(bicapaBtn.getAttribute('aria-pressed')).toBe('true')
+      expect(tricapaBtn.getAttribute('aria-pressed')).toBe('false')
+      expect(doc.getElementById('paintTypeTotalRow').hidden).toBe(false)
+      expect(doc.getElementById('paintTypeTotalValue').textContent).toBe('Bicapa')
+      expect(doc.getElementById('grandTotal').textContent).toContain('590.000')
+
+      tricapaBtn.click()
+      expect(win.active.paintType).toBe('Tricapa')
+      expect(bicapaBtn.getAttribute('aria-pressed')).toBe('false')
+      expect(tricapaBtn.getAttribute('aria-pressed')).toBe('true')
+      expect(doc.getElementById('paintTypeTotalValue').textContent).toBe('Tricapa')
+      expect(doc.getElementById('grandTotal').textContent).toContain('590.000')
+
+      // Volver a Modo B: conserva intactos los datos por pieza ($210.000) y al regresar a Modo A conserva los $590.000
+      win.setBudgetMode('detailed')
+      expect(doc.querySelectorAll('.piece-quote-group')).toHaveLength(1)
+      expect(doc.getElementById('grandTotal').textContent).toContain('210.000')
+
+      win.setBudgetMode('summary')
+      expect(doc.getElementById('grandTotal').textContent).toContain('590.000')
+    } finally {
+      win.close()
+    }
+  })
+
+  it('5. REGRESIÓN ENCABEZADO: Elimina definitivamente el indicador «Taller: Taller de Prueba» de la barra superior en PC y celular sin dejar espacios vacíos y conservando el selector en «Mi taller»', async () => {
+    appAuthState.memberships = [
+      { workshop_id: 'w1', role: 'owner', workshop: { id: 'w1', name: 'Taller de Prueba', legal_name: 'Taller de Prueba SRL' } },
+      { workshop_id: 'w2', role: 'staff', workshop: { id: 'w2', name: 'Crash Solution', legal_name: 'Crash Solution SRL' } }
+    ]
+    appAuthState.activeWorkshopId = 'w1'
+
+    renderHeaderNavigation()
+
+    const headerEl = document.querySelector('.app-header')
+    const headerToolsEl = headerEl.querySelector('.header-tools')
+    expect(document.getElementById('saveState')).toBeNull()
+    expect(headerToolsEl?.hidden).toBe(true)
+    expect(headerToolsEl?.childElementCount).toBe(0)
+    expect(headerEl.textContent).not.toContain('Taller: Taller de Prueba')
+    expect(headerEl.textContent).not.toContain('Taller:')
+
+    // Al cambiar de taller con switchActiveWorkshop tampoco vuelve a aparecer el indicador en el encabezado
+    await switchActiveWorkshop('w2')
+    expect(document.getElementById('saveState')).toBeNull()
+    expect(headerToolsEl?.hidden).toBe(true)
+    expect(headerToolsEl?.childElementCount).toBe(0)
+    expect(headerEl.textContent).not.toContain('Taller:')
+    expect(document.getElementById('profileMenuToggle')).not.toBeNull()
+
+    // Verificar en «Mi taller» que el selector de taller sigue intacto
+    await navigateAppRoute({ name: 'profile' })
+    const wsSelect = document.getElementById('activeWorkshopSelect')
+    expect(wsSelect).not.toBeNull()
+    expect(wsSelect.value).toBe('w2')
+
+    // Verificar en CSS que .header-tools y #saveState tienen display: none !important (sin espacio vacío en PC ni móvil)
+    const stylesCss = readFileSync(resolve('Crash_Solution_Publicacion/src/styles.css'), 'utf8')
+    expect(stylesCss).toContain('.app-header .header-tools, #saveState { display: none !important; }')
+  })
+})
+

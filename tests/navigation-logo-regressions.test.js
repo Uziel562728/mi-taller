@@ -5,7 +5,7 @@ import { JSDOM } from 'jsdom'
 
 const backend = vi.hoisted(() => ({ from: vi.fn(), storage: { from: vi.fn() }, auth: { signOut: vi.fn(async () => ({ error: null })) } }))
 vi.mock('../Crash_Solution_Publicacion/src/lib/supabase.js', () => ({ supabase: backend, isSupabaseConfigured: true }))
-import { appAuthState, enforceRouteProtection, renderHeaderNavigation, leavePasswordScreen, renderProfileScreen, resetAppRouter } from '../Crash_Solution_Publicacion/src/main.js'
+import { appAuthState, enforceRouteProtection, renderHeaderNavigation, leavePasswordScreen, renderProfileScreen, resetAppRouter, navigateAppRoute } from '../Crash_Solution_Publicacion/src/main.js'
 import { uploadWorkshopLogo, fetchWorkshopProfile } from '../Crash_Solution_Publicacion/src/lib/workshop-profile.js'
 import { privateReadCache } from '../Crash_Solution_Publicacion/src/lib/scoped-cache.js'
 
@@ -81,6 +81,38 @@ describe('Navegación de sesión', () => {
     expect(document.getElementById('mobileNavToggle').getAttribute('aria-expanded')).toBe('false')
   })
 
+  it.each(['owner', 'admin', 'staff'])(
+    'elimina definitivamente el indicador «Taller: Taller de Prueba» (#saveState) del encabezado para %s conservando avatar, navegación y selector en «Mi taller»',
+    async role => {
+      mount(role)
+      appAuthState.memberships = [
+        { workshop_id: 'w1', role, workshop: { id: 'w1', name: 'Taller de Prueba' } },
+        { workshop_id: 'w2', role, workshop: { id: 'w2', name: 'Crash Solution' } }
+      ]
+      renderHeaderNavigation()
+
+      const header = document.querySelector('header')
+      expect(header.querySelector('#saveState')).toBeNull()
+      expect(header.querySelector('.header-tools')?.hidden).toBe(true)
+      expect(header.querySelector('.header-tools')?.childElementCount).toBe(0)
+      expect(header.textContent).not.toContain('Taller: Taller de Prueba')
+      expect(header.textContent).not.toContain('Taller:')
+
+      // Mantiene el avatar y opciones de navegación (PC y móvil)
+      expect(document.getElementById('profileMenuToggle')).not.toBeNull()
+      expect(document.getElementById('navJobsBtn')).not.toBeNull()
+      expect(document.getElementById('navStockBtn')).not.toBeNull()
+      expect(!!document.getElementById('navAdminBtn')).toBe(role !== 'staff')
+      expect(document.getElementById('mobileNavToggle')).not.toBeNull()
+
+      // Conserva el selector de taller dentro de «Mi taller»
+      await renderProfileScreen()
+      const selector = document.getElementById('activeWorkshopSelect')
+      expect(selector).not.toBeNull()
+      expect(Array.from(selector.options).map(o => o.value)).toEqual(['w1', 'w2'])
+    }
+  )
+
   it('vuelve desde contraseña sin reemplazar el trabajo ni los campos pendientes', async () => {
     renderHeaderNavigation()
     const draft = { id: 'draft', rec: { cliente: 'Sin sincronizar' }, area: 'Parte delantera' }
@@ -93,7 +125,7 @@ describe('Navegación de sesión', () => {
     document.getElementById('workScreen').innerHTML = '<input value="Dato pendiente">'
     document.getElementById('workScreen').hidden = false
     document.getElementById('jobsScreen').hidden = true
-    document.getElementById('navChangePassBtn').click()
+    await navigateAppRoute({ name: 'password' })
     document.getElementById('cancelUpdatePassBtn').click()
     await vi.waitFor(() => expect(appAuthState.authMode).toBe('login'))
     expect(appAuthState.authMode).toBe('login')
@@ -104,9 +136,9 @@ describe('Navegación de sesión', () => {
     expect(document.getElementById('workScreen').hidden).toBe(false)
   })
 
-  it('permite navegar a trabajos desde contraseña y cerrar el cuadro', () => {
+  it('permite navegar a trabajos desde contraseña y cerrar el cuadro', async () => {
     renderHeaderNavigation()
-    document.getElementById('navChangePassBtn').click()
+    await navigateAppRoute({ name: 'password' })
     document.getElementById('navJobsBtn').click()
     expect(window.showJobs).toHaveBeenCalled()
     expect(document.getElementById('updatePassForm')).toBeNull()
@@ -124,7 +156,7 @@ describe('Navegación de sesión', () => {
 
   it('permite cerrar sesión desde contraseña y vuelve al ingreso', async () => {
     renderHeaderNavigation()
-    document.getElementById('navChangePassBtn').click()
+    await navigateAppRoute({ name: 'password' })
     document.getElementById('navLogoutBtn').click()
     await vi.waitFor(() => expect(appAuthState.user).toBeNull())
     expect(backend.auth.signOut).toHaveBeenCalled()

@@ -13,6 +13,78 @@ const toBounded = (v, min, max) => Math.min(max, Math.max(min, toSafeNumber(v)))
 const defaultUid = () =>
   globalThis.crypto?.randomUUID?.() || `q-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
 
+export const VALID_BUDGET_MODES = Object.freeze(['detailed', 'summary'])
+export const VALID_PAINT_TYPES = Object.freeze(['Bicapa', 'Tricapa'])
+
+/**
+ * Formatea una cantidad numérica en formato argentino (coma decimal, ej. 2,5)
+ * sin alterar la precisión ni el tipo numérico utilizado en los cálculos.
+ */
+export function formatArQuantity(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return '0'
+  const rounded = Math.round(Math.max(0, n) * 100) / 100
+  return new Intl.NumberFormat('es-AR', {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2
+  }).format(rounded)
+}
+
+/**
+ * Resuelve el modo de presupuesto individual del trabajo ('detailed' | 'summary').
+ * No modifica presupuestos históricos: si no tienen modo explícito, usa 'detailed'.
+ */
+export function resolveBudgetMode(job = {}, modeOverride = null) {
+  const candidate = String(modeOverride || job?.budgetMode || job?.document?.budgetMode || '')
+    .trim()
+    .toLowerCase()
+  if (candidate === 'summary' || candidate === 'resumido' || candidate === 'a') {
+    return 'summary'
+  }
+  return 'detailed'
+}
+
+/**
+ * Normaliza los valores manuales del Modo A (Totalizar al final).
+ */
+export function normalizeSummaryBudget(raw = {}) {
+  const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+  const chapaDays = Math.round(toSafeNumber(src.chapaDays) * 100) / 100
+  const chapaDayPrice = toSafeNumber(src.chapaDayPrice ?? src.chapaDayRate)
+  const pinturaPanels = Math.round(toSafeNumber(src.pinturaPanels) * 100) / 100
+  const pinturaPanelPrice = toSafeNumber(src.pinturaPanelPrice ?? src.pinturaPanelRate)
+  return {
+    chapaDays,
+    chapaDayPrice,
+    chapaDayRate: chapaDayPrice,
+    chapaSubtotal: chapaDays * chapaDayPrice,
+    pinturaPanels,
+    pinturaPanelPrice,
+    pinturaPanelRate: pinturaPanelPrice,
+    pinturaSubtotal: pinturaPanels * pinturaPanelPrice
+  }
+}
+
+/**
+ * Normaliza el tipo de pintura del vehículo ('Bicapa' | 'Tricapa' | '').
+ * Nunca selecciona un valor automáticamente ni altera tarifas.
+ */
+export function normalizePaintType(raw) {
+  const clean = String(raw ?? '').trim().toLowerCase()
+  if (clean === 'bicapa') return 'Bicapa'
+  if (clean === 'tricapa') return 'Tricapa'
+  return ''
+}
+
+export function resolvePaintType(job = {}) {
+  return normalizePaintType(job?.paintType ?? job?.document?.paintType ?? '')
+}
+
+export function resolveBudgetObservations(job = {}) {
+  const obs = job?.document?.terms ?? job?.document?.observations ?? job?.observations ?? ''
+  return String(obs || '').trim()
+}
+
 /**
  * Normaliza el nombre de una intervención marcada en la inspección.
  */
@@ -40,7 +112,7 @@ export function normalizeWorkIntervention(rawWork) {
       unit: 'paños',
       qtyLabel: 'Paños de pintura',
       priceLabel: 'Precio por paño',
-      qtyPlaceholder: 'Ej. 1.5',
+      qtyPlaceholder: 'Ej. 1,5',
       pricePlaceholder: 'Tarifa por paño',
       step: '0.5'
     }
@@ -89,16 +161,18 @@ export function normalizeWorkIntervention(rawWork) {
  * Extrae metadatos normalizados de cualquier renglón del presupuesto (nuevo o histórico).
  */
 export function describeQuoteLine(line = {}) {
-  const source = line?.source ? String(line.source) : null
+  const rawSource = line?.source ? String(line.source) : null
+  const source = rawSource && rawSource !== 'manual' && rawSource !== 'inspection' ? rawSource : null
   const pieceKey = line?.pieceKey ? String(line.pieceKey) : source
   const hasSeparator = Boolean(pieceKey && pieceKey.includes('|||'))
-  const zoneName = line?.zoneName || (hasSeparator ? pieceKey.split('|||')[0] : '')
+  const zoneName = line?.zoneName || line?.area || (hasSeparator ? pieceKey.split('|||')[0] : '')
   const pieceName =
     line?.pieceName ||
+    line?.piece ||
     (hasSeparator ? pieceKey.split('|||')[1] : '') ||
     (pieceKey && !hasSeparator ? pieceKey : '')
 
-  const rawDesc = String(line?.description || '').trim()
+  const rawDesc = String(line?.description || line?.desc || '').trim()
   let inferredWorkType = line?.workType ? String(line.workType).trim() : ''
 
   if (!inferredWorkType && pieceKey) {
@@ -129,7 +203,8 @@ export function describeQuoteLine(line = {}) {
       ? `${pieceName} · ${workLabel}`
       : rawDesc || (pieceName ? pieceName : 'Trabajo o repuesto')
 
-  const qtyWithUnit = unit ? `${qty} ${unit}` : String(qty)
+  const qtyFormatted = formatArQuantity(qty)
+  const qtyWithUnit = unit ? `${qtyFormatted} ${unit}` : qtyFormatted
 
   return {
     isInspectionPiece: Boolean(pieceKey && workType),
@@ -145,6 +220,7 @@ export function describeQuoteLine(line = {}) {
     pricePlaceholder: meta?.pricePlaceholder || 'Precio unitario',
     step: meta?.step || '0.1',
     qty,
+    qtyFormatted,
     price,
     subtotal,
     displayDescription,
@@ -338,7 +414,7 @@ export function syncBudgetFromInspection(job, uidFn = defaultUid) {
 
   for (const q of job.quote) {
     if (!q || typeof q !== 'object') continue
-    if (!q.source && !q.pieceKey) {
+    if ((!q.source || q.source === 'manual') && !q.pieceKey) {
       manualOrProtectedLines.push(q)
       continue
     }
@@ -434,13 +510,15 @@ export function computeDetailedBudgetTotals(job = {}) {
     }
   }
 
-  const discountPct = toBounded(job?.discount, 0, 100)
-  const taxPct = toBounded(job?.tax, 0, 100)
+  const discountPct = toBounded(job?.discount ?? job?.discountPct, 0, 100)
+  const taxPct = toBounded(job?.tax ?? job?.taxPct, 0, 100)
   const discount = (subtotal * discountPct) / 100
   const net = subtotal - discount
   const tax = (net * taxPct) / 100
+  const total = net + tax
 
   return {
+    mode: 'detailed',
     subtotal,
     chapaSubtotal,
     chapaDays: Math.round(chapaDays * 100) / 100,
@@ -451,10 +529,179 @@ export function computeDetailedBudgetTotals(job = {}) {
     otherSubtotal,
     pieceSubtotals,
     discount,
+    discountAmount: discount,
     discountPct,
     net,
     tax,
+    taxAmount: tax,
     taxPct,
-    total: net + tax
+    total,
+    grandTotal: total
+  }
+}
+
+/**
+ * Calcula los totales en Modo A — Totalizar al final (para compañías de seguros / presentación resumida).
+ * - Usa exclusivamente las cantidades y precios manuales de `job.summaryBudget` para Chapa y Pintura.
+ * - Suma como repuestos y otros trabajos las líneas manuales (`!isInspectionPiece`).
+ * - Conserva intactos `job.pieceQuotes` y las líneas por pieza de `job.quote` sin duplicar cargos.
+ */
+export function computeSummaryBudgetTotals(job = {}) {
+  const sb = normalizeSummaryBudget(job?.summaryBudget)
+  const quoteLines = Array.isArray(job?.quote) ? job.quote : []
+
+  let otherSubtotal = 0
+  const manualItems = []
+  for (const rawLine of quoteLines) {
+    if (!rawLine || typeof rawLine !== 'object') continue
+    const info = describeQuoteLine(rawLine)
+    if (!info.isInspectionPiece) {
+      otherSubtotal += info.subtotal
+      manualItems.push(info)
+    }
+  }
+
+  const chapaSubtotal = sb.chapaSubtotal
+  const pinturaSubtotal = sb.pinturaSubtotal
+  const subtotal = chapaSubtotal + pinturaSubtotal + otherSubtotal
+
+  const discountPct = toBounded(job?.discount ?? job?.discountPct, 0, 100)
+  const taxPct = toBounded(job?.tax ?? job?.taxPct, 0, 100)
+  const discount = (subtotal * discountPct) / 100
+  const net = subtotal - discount
+  const tax = (net * taxPct) / 100
+  const total = net + tax
+
+  return {
+    mode: 'summary',
+    subtotal,
+    chapaSubtotal,
+    chapaDays: sb.chapaDays,
+    chapaDayPrice: sb.chapaDayPrice,
+    chapaCount: sb.chapaDays > 0 || sb.chapaSubtotal > 0 ? 1 : 0,
+    pinturaSubtotal,
+    pinturaPanels: sb.pinturaPanels,
+    pinturaPanelPrice: sb.pinturaPanelPrice,
+    pinturaCount: sb.pinturaPanels > 0 || sb.pinturaSubtotal > 0 ? 1 : 0,
+    otherSubtotal,
+    manualItems,
+    pieceSubtotals: {},
+    discount,
+    discountAmount: discount,
+    discountPct,
+    net,
+    tax,
+    taxAmount: tax,
+    taxPct,
+    total,
+    grandTotal: total
+  }
+}
+
+/**
+ * Construye los renglones resumidos para mostrar en PDF / Impresión A4 / WhatsApp cuando el presupuesto está en Modo A.
+ * Nunca inventa distribución por pieza cuando solo se cargaron cantidades generales.
+ */
+export function buildSummaryPresentationLines(job = {}) {
+  const sb = normalizeSummaryBudget(job?.summaryBudget)
+  const lines = []
+
+  if (sb.chapaDays > 0 || sb.chapaSubtotal > 0) {
+    const qtyFormatted = formatArQuantity(sb.chapaDays)
+    lines.push({
+      id: 'summary-chapa',
+      isSummaryLine: true,
+      workType: 'Chapa',
+      workLabel: 'Chapa',
+      description: 'Trabajo de chapa (Total días)',
+      displayDescription: 'Trabajo de chapa (Total días)',
+      qty: sb.chapaDays,
+      qtyFormatted,
+      unit: 'días',
+      qtyWithUnit: `${qtyFormatted} días`,
+      price: sb.chapaDayPrice,
+      subtotal: sb.chapaSubtotal
+    })
+  }
+
+  if (sb.pinturaPanels > 0 || sb.pinturaSubtotal > 0) {
+    const qtyFormatted = formatArQuantity(sb.pinturaPanels)
+    lines.push({
+      id: 'summary-pintura',
+      isSummaryLine: true,
+      workType: 'Pintura',
+      workLabel: 'Pintura',
+      description: 'Trabajo de pintura (Total paños)',
+      displayDescription: 'Trabajo de pintura (Total paños)',
+      qty: sb.pinturaPanels,
+      qtyFormatted,
+      unit: 'paños',
+      qtyWithUnit: `${qtyFormatted} paños`,
+      price: sb.pinturaPanelPrice,
+      subtotal: sb.pinturaSubtotal
+    })
+  }
+
+  const quoteLines = Array.isArray(job?.quote) ? job.quote : []
+  for (const rawLine of quoteLines) {
+    if (!rawLine || typeof rawLine !== 'object') continue
+    const info = describeQuoteLine(rawLine)
+    if (!info.isInspectionPiece && (String(rawLine.description || '').trim() || info.subtotal > 0)) {
+      lines.push({
+        ...info,
+        id: rawLine.id || 'manual-line',
+        isSummaryLine: false,
+        description: String(rawLine.description || '').trim() || info.displayDescription,
+        displayDescription: String(rawLine.description || '').trim() || info.displayDescription,
+        qtyFormatted: info.qtyFormatted,
+        qtyWithUnit: rawLine.unit ? `${info.qtyFormatted} ${rawLine.unit}` : info.qtyFormatted
+      })
+    }
+  }
+
+  return lines
+}
+
+/**
+ * Calcula los totales según el modo elegido en el presupuesto ('detailed' | 'summary') o un modo explícito.
+ */
+export function computeBudgetTotalsByMode(job = {}, modeOverride = null) {
+  const mode = resolveBudgetMode(job, modeOverride)
+  if (mode === 'summary') {
+    return computeSummaryBudgetTotals(job)
+  }
+  return computeDetailedBudgetTotals(job)
+}
+
+/**
+ * Verifica si un trabajo posee datos tanto en Modo A (resumido) como en Modo B (detallado)
+ * y comprueba si sus totales coinciden o difieren, evitando mezclar totales distintos silenciosamente.
+ */
+export function checkBudgetModesConsistency(job = {}) {
+  const sb = normalizeSummaryBudget(job?.summaryBudget)
+  const quoteLines = Array.isArray(job?.quote) ? job.quote : []
+  const pieceLines = quoteLines.filter(q => describeQuoteLine(q).isInspectionPiece)
+
+  const hasSummaryChapaOrPintura = sb.chapaDays > 0 || sb.pinturaPanels > 0 || sb.chapaSubtotal > 0 || sb.pinturaSubtotal > 0
+  const hasDetailedPieces = pieceLines.some(q => toSafeNumber(q?.qty) > 0 || toSafeNumber(q?.price) > 0)
+
+  const summaryTotals = computeSummaryBudgetTotals(job)
+  const detailedTotals = computeDetailedBudgetTotals(job)
+
+  const bothPopulated = Boolean(hasSummaryChapaOrPintura && hasDetailedPieces)
+  const difference = Math.round(Math.abs(summaryTotals.total - detailedTotals.total) * 100) / 100
+  const consistent = !bothPopulated || difference < 0.01
+
+  return {
+    hasSummaryData: hasSummaryChapaOrPintura || summaryTotals.otherSubtotal > 0,
+    hasSummaryChapaOrPintura,
+    hasDetailedData: hasDetailedPieces || detailedTotals.otherSubtotal > 0,
+    hasDetailedPieces,
+    bothPopulated,
+    hasBothModesData: bothPopulated,
+    consistent,
+    summaryTotal: summaryTotals.total,
+    detailedTotal: detailedTotals.total,
+    difference
   }
 }

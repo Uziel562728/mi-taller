@@ -1,7 +1,12 @@
 import { jsPDF } from 'jspdf'
 import { formatCuit } from './workshop-profile.js'
 import {
+  resolveBudgetMode,
+  resolvePaintType,
+  resolveBudgetObservations,
+  buildSummaryPresentationLines,
   formatArsCurrency,
+  formatArQuantity,
   getVehicleYear,
   formatIsoDateAr,
   computeExpiryIsoDate,
@@ -60,13 +65,18 @@ export function verifyPdfBytesIntegrity(bytes) {
 
 /**
  * Genera el documento PDF real (instancia jsPDF) con logo, CUIT, datos del taller,
- * cliente, vehículo, tabla de trabajos/repuestos, totales, vigencia y observaciones.
+ * cliente, vehículo, tabla de trabajos/repuestos (en modo resumido o detallado),
+ * tipo de pintura, totales, vigencia, observaciones y espacio para firma del taller emisor.
  */
-export function createBudgetJsPdfDocument(job = {}, shop = {}) {
-  const check = validateBudgetForDelivery(job)
+export function createBudgetJsPdfDocument(job = {}, shop = {}, options = {}) {
+  const check = validateBudgetForDelivery(job, options)
   if (!check.valid) {
     throw new Error(check.error)
   }
+
+  const mode = resolveBudgetMode(job, options?.mode || null)
+  const paintType = resolvePaintType(job)
+  const observationsText = resolveBudgetObservations(job)
 
   const doc = new jsPDF({
     orientation: 'portrait',
@@ -236,7 +246,8 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
 
   const plateAndYearLine = [
     plateText ? `Patente: ${plateText}` : '',
-    yearText ? `Año: ${yearText}` : ''
+    yearText ? `Año: ${yearText}` : '',
+    paintType ? `Pintura: ${sanitizePdfText(paintType)}` : ''
   ]
     .filter(Boolean)
     .join(' · ')
@@ -254,7 +265,8 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
 
   y += boxHeight + 7
 
-  // 3. Tabla de Trabajos y Repuestos
+  // 3. Tabla de Trabajos y Repuestos (adaptada al modo elegido: resumido o detallado por ítem)
+  const firstColHeader = mode === 'summary' ? 'CONCEPTO / TRABAJO' : 'PIEZA / INTERVENCIÓN'
   const renderTableHeader = currentY => {
     doc.setFillColor(237, 243, 253)
     doc.setDrawColor(217, 225, 233)
@@ -262,7 +274,7 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
     doc.setFont('helvetica', 'bold')
     doc.setFontSize(8.5)
     doc.setTextColor(40, 70, 110)
-    doc.text('PIEZA / INTERVENCIÓN', margin + 3, currentY + 5.3)
+    doc.text(firstColHeader, margin + 3, currentY + 5.3)
     doc.text('CANT. / UNID.', margin + 112, currentY + 5.3, { align: 'right' })
     doc.text('PRECIO UNIT.', margin + 145, currentY + 5.3, { align: 'right' })
     doc.text('SUBTOTAL', pageWidth - margin - 3, currentY + 5.3, { align: 'right' })
@@ -275,9 +287,13 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
   doc.setFontSize(9.2)
   doc.setTextColor(29, 51, 72)
 
-  for (const line of job.quote || []) {
-    const info = describeQuoteLine(line)
-    const descText = sanitizePdfText(info.displayDescription || line.description || '')
+  const tableRows =
+    mode === 'summary'
+      ? buildSummaryPresentationLines(job)
+      : (job.quote || []).map(line => ({ rawLine: line, ...describeQuoteLine(line) }))
+
+  for (const row of tableRows) {
+    const descText = sanitizePdfText(row.displayDescription || row.description || '')
     const descLines = doc.splitTextToSize(descText, 88)
     const rowHeight = Math.max(8, descLines.length * 4.6 + 3.4)
 
@@ -291,15 +307,15 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
     }
 
     const qtyDisplay =
-      info.isInspectionPiece || line?.unit || line?.workType
-        ? sanitizePdfText(`${info.qty} ${info.unit}`)
-        : String(info.qty)
+      row.isSummaryLine || row.isInspectionPiece || row.rawLine?.unit || row.rawLine?.workType
+        ? sanitizePdfText(`${formatArQuantity(row.qty)} ${row.unit}`)
+        : sanitizePdfText(formatArQuantity(row.qty))
 
     doc.text(descLines, margin + 3, y + 5.2)
     doc.text(qtyDisplay, margin + 112, y + 5.2, { align: 'right' })
-    doc.text(formatArsCurrency(info.price), margin + 145, y + 5.2, { align: 'right' })
+    doc.text(formatArsCurrency(row.price), margin + 145, y + 5.2, { align: 'right' })
     doc.setFont('helvetica', 'bold')
-    doc.text(formatArsCurrency(info.subtotal), pageWidth - margin - 3, y + 5.2, { align: 'right' })
+    doc.text(formatArsCurrency(row.subtotal), pageWidth - margin - 3, y + 5.2, { align: 'right' })
     doc.setFont('helvetica', 'normal')
 
     doc.setDrawColor(225, 231, 237)
@@ -311,8 +327,9 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
   y += 5
 
   // 4. Cuadro de Totales (con resumen separado de Chapa y Pintura además del total general)
-  const t = computeBudgetTotals(job)
+  const t = computeBudgetTotals(job, { mode })
   const extraSummaryRows =
+    (paintType ? 1 : 0) +
     (t.chapaCount > 0 || t.chapaSubtotal > 0 ? 1 : 0) +
     (t.pinturaCount > 0 || t.pinturaSubtotal > 0 ? 1 : 0) +
     (t.otherSubtotal > 0 && (t.chapaCount > 0 || t.pinturaCount > 0) ? 1 : 0)
@@ -329,9 +346,17 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
   doc.setFontSize(9.2)
   doc.setTextColor(65, 84, 104)
 
+  if (paintType) {
+    doc.setFont('helvetica', 'normal')
+    doc.text('Tipo de pintura:', totalsBoxX, totalsY + 5)
+    doc.setFont('helvetica', 'bold')
+    doc.text(sanitizePdfText(paintType), pageWidth - margin, totalsY + 5, { align: 'right' })
+    totalsY += 6
+  }
+
   if (t.chapaCount > 0 || t.chapaSubtotal > 0) {
     doc.setFont('helvetica', 'normal')
-    doc.text(sanitizePdfText(`Resumen Chapa (${t.chapaDays} días):`), totalsBoxX, totalsY + 5)
+    doc.text(sanitizePdfText(`Resumen Chapa (${formatArQuantity(t.chapaDays)} días):`), totalsBoxX, totalsY + 5)
     doc.setFont('helvetica', 'bold')
     doc.text(formatArsCurrency(t.chapaSubtotal), pageWidth - margin, totalsY + 5, { align: 'right' })
     totalsY += 6
@@ -339,7 +364,7 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
 
   if (t.pinturaCount > 0 || t.pinturaSubtotal > 0) {
     doc.setFont('helvetica', 'normal')
-    doc.text(sanitizePdfText(`Resumen Pintura (${t.pinturaPanels} paños):`), totalsBoxX, totalsY + 5)
+    doc.text(sanitizePdfText(`Resumen Pintura (${formatArQuantity(t.pinturaPanels)} paños):`), totalsBoxX, totalsY + 5)
     doc.setFont('helvetica', 'bold')
     doc.text(formatArsCurrency(t.pinturaSubtotal), pageWidth - margin, totalsY + 5, { align: 'right' })
     totalsY += 6
@@ -389,11 +414,17 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
 
   y = totalsY + 8
 
-  // 5. Condiciones y Observaciones
-  if (d.terms && String(d.terms).trim()) {
-    const termsLines = doc.splitTextToSize(sanitizePdfText(d.terms).trim(), contentWidth - 6)
+  // 5. Condiciones y Observaciones generales
+  if (observationsText || paintType) {
+    const combinedObs = [
+      paintType ? `Sistema de pintura del vehículo: ${paintType}.` : '',
+      observationsText
+    ]
+      .filter(Boolean)
+      .join('\n')
+    const termsLines = doc.splitTextToSize(sanitizePdfText(combinedObs).trim(), contentWidth - 6)
     const termsHeight = termsLines.length * 4.5 + 10
-    if (y + termsHeight > pageHeight - 22) {
+    if (y + termsHeight > pageHeight - 52) {
       doc.addPage()
       y = margin
     }
@@ -411,7 +442,40 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
     y += termsHeight + 5
   }
 
-  // 6. Pie de página institucional
+  // 6. Espacio para firma del taller emisor (permite firma manual o sello cuando no existe firma digital; no exige firma del cliente ni inventa firmas ficticias)
+  const sigBoxHeight = 26
+  const sigBoxWidth = 82
+  const sigBoxX = pageWidth - margin - sigBoxWidth
+  if (y + sigBoxHeight > pageHeight - 22) {
+    doc.addPage()
+    y = margin + 6
+  }
+  const sigFormat = detectImageFormatFromDataUrl(shop?.signature_url)
+  if (sigFormat && shop?.signature_url) {
+    try {
+      doc.addImage(shop.signature_url, sigFormat, sigBoxX + 18, y, 46, 13)
+    } catch {
+      // Mantiene el espacio en blanco para firma manual
+    }
+  }
+  const sigLineY = y + 15
+  doc.setDrawColor(120, 136, 154)
+  doc.setLineWidth(0.35)
+  doc.line(sigBoxX, sigLineY, pageWidth - margin, sigLineY)
+
+  doc.setFont('helvetica', 'bold')
+  doc.setFontSize(8.2)
+  doc.setTextColor(19, 44, 67)
+  doc.text('FIRMA Y SELLO DEL TALLER EMISOR', sigBoxX + sigBoxWidth / 2, sigLineY + 4.2, { align: 'center' })
+
+  doc.setFont('helvetica', 'normal')
+  doc.setFontSize(7.8)
+  doc.setTextColor(85, 102, 120)
+  const sigWorkshopLine = [shopName, legalName, cuit ? `CUIT ${cuit}` : ''].filter(Boolean).join(' · ')
+  doc.text(sigWorkshopLine.slice(0, 62), sigBoxX + sigBoxWidth / 2, sigLineY + 8.2, { align: 'center' })
+  y = sigLineY + 12
+
+  // 7. Pie de página institucional
   const footerY = pageHeight - 13
   doc.setDrawColor(225, 231, 237)
   doc.setLineWidth(0.2)
@@ -441,8 +505,8 @@ export function createBudgetJsPdfDocument(job = {}, shop = {}) {
   return doc
 }
 
-export function generateBudgetPdfBytes(job = {}, shop = {}) {
-  const doc = createBudgetJsPdfDocument(job, shop)
+export function generateBudgetPdfBytes(job = {}, shop = {}, options = {}) {
+  const doc = createBudgetJsPdfDocument(job, shop, options)
   const arrayBuffer = doc.output('arraybuffer')
   const bytes = new Uint8Array(arrayBuffer)
   const integrity = verifyPdfBytesIntegrity(bytes)
@@ -452,13 +516,13 @@ export function generateBudgetPdfBytes(job = {}, shop = {}) {
   return bytes
 }
 
-export function generateBudgetPdfBlob(job = {}, shop = {}) {
-  const bytes = generateBudgetPdfBytes(job, shop)
+export function generateBudgetPdfBlob(job = {}, shop = {}, options = {}) {
+  const bytes = generateBudgetPdfBytes(job, shop, options)
   return new Blob([bytes], { type: 'application/pdf' })
 }
 
-export function generateBudgetPdfFile(job = {}, shop = {}) {
-  const blob = generateBudgetPdfBlob(job, shop)
+export function generateBudgetPdfFile(job = {}, shop = {}, options = {}) {
+  const blob = generateBudgetPdfBlob(job, shop, options)
   const filename = buildBudgetFilename(job)
   return new File([blob], filename, { type: 'application/pdf' })
 }
@@ -468,8 +532,8 @@ export function generateBudgetPdfFile(job = {}, shop = {}) {
  * Conserva el enlace en el DOM durante la activación del gestor de descargas del sistema
  * y difiere la revocación del ObjectURL para evitar descargas truncadas o canceladas en Android.
  */
-export function downloadBudgetPdf(job = {}, shop = {}, docObj = globalThis.document) {
-  const blob = generateBudgetPdfBlob(job, shop)
+export function downloadBudgetPdf(job = {}, shop = {}, docObj = globalThis.document, options = {}) {
+  const blob = generateBudgetPdfBlob(job, shop, options)
   const filename = buildBudgetFilename(job)
 
   if (!blob || blob.size <= 0) {

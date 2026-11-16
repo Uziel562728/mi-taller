@@ -3,6 +3,19 @@ import { getProfileInitials, updatePersonalProfile } from './lib/personal-profil
 import { createAppRouter, readAppRoute, routeHash, routeForSnapshot } from './lib/app-router.js'
 import { privateReadCache } from './lib/scoped-cache.js'
 import { resetInvitationRequests, isPasswordSetupCallback } from './lib/admin-service.js'
+import {
+  parseAuthCallbackUrl,
+  decodeJwtPayload,
+  computeTokenFingerprint,
+  readStoredSupabaseSessionUser,
+  prepareInitialAuthCallbackInWindow,
+  getCapturedInitialCallback,
+  clearCapturedInitialCallback,
+  establishAndVerifyCallbackSession,
+  markTokenConsumed,
+  isTokenAlreadyConsumed,
+  clearConsumedTokens
+} from './lib/auth-callback.js'
 import { fetchAllPages } from './lib/paged-query.js'
 import { supabase, isSupabaseConfigured } from './lib/supabase.js'
 import {
@@ -93,10 +106,22 @@ import {
   inferErrorDetails
 } from './lib/notifications.js'
 import {
+  VALID_BUDGET_MODES,
+  VALID_PAINT_TYPES,
+  resolveBudgetMode,
+  normalizeSummaryBudget,
+  normalizePaintType,
+  resolvePaintType,
+  resolveBudgetObservations,
   normalizeWorkIntervention,
   describeQuoteLine,
   syncBudgetFromInspection,
-  computeDetailedBudgetTotals
+  computeDetailedBudgetTotals,
+  computeSummaryBudgetTotals,
+  buildSummaryPresentationLines,
+  computeBudgetTotalsByMode,
+  checkBudgetModesConsistency,
+  formatArQuantity
 } from './lib/piece-budget.js'
 
 export {
@@ -108,10 +133,31 @@ export {
   showSuccessToast,
   clearAllTransientErrors,
   inferErrorDetails,
+  VALID_BUDGET_MODES,
+  VALID_PAINT_TYPES,
+  resolveBudgetMode,
+  normalizeSummaryBudget,
+  normalizePaintType,
+  resolvePaintType,
+  resolveBudgetObservations,
   normalizeWorkIntervention,
   describeQuoteLine,
   syncBudgetFromInspection,
-  computeDetailedBudgetTotals
+  computeDetailedBudgetTotals,
+  computeSummaryBudgetTotals,
+  buildSummaryPresentationLines,
+  computeBudgetTotalsByMode,
+  checkBudgetModesConsistency,
+  formatArQuantity,
+  parseAuthCallbackUrl,
+  decodeJwtPayload,
+  prepareInitialAuthCallbackInWindow,
+  getCapturedInitialCallback,
+  clearCapturedInitialCallback,
+  establishAndVerifyCallbackSession,
+  markTokenConsumed,
+  isTokenAlreadyConsumed,
+  clearConsumedTokens
 }
 
 if (typeof window !== 'undefined') {
@@ -122,10 +168,20 @@ if (typeof window !== 'undefined') {
     markFieldError,
     clearFieldErrors,
     showSuccessToast,
+    resolveBudgetMode,
+    normalizeSummaryBudget,
+    normalizePaintType,
+    resolvePaintType,
+    resolveBudgetObservations,
     normalizeWorkIntervention,
     describeQuoteLine,
     syncBudgetFromInspection,
-    computeDetailedBudgetTotals
+    computeDetailedBudgetTotals,
+    computeSummaryBudgetTotals,
+    buildSummaryPresentationLines,
+    computeBudgetTotalsByMode,
+    checkBudgetModesConsistency,
+    formatArQuantity
   })
 }
 
@@ -166,7 +222,8 @@ export const appAuthState = {
   stockVisibleCount: 40,
   stockRenderFilterKey: '',
   movementTargetItem: null,
-  workshopSettings: { ...DEFAULT_WORKSHOP_SETTINGS }
+  workshopSettings: { ...DEFAULT_WORKSHOP_SETTINGS },
+  passwordFlowContext: null
 }
 
 function getActiveMembership() {
@@ -218,6 +275,10 @@ export function resetAppRouter() {
   appRouter?.dispose()
   appRouter = null
   routeInitializedFor = null
+  initialRecoveryRequested = false
+  appAuthState.passwordFlowContext = null
+  clearCapturedInitialCallback()
+  clearConsumedTokens()
 }
 
 function getAppRouter() {
@@ -464,33 +525,54 @@ function renderAuthScreen() {
   const isReset = mode === 'reset'
   const isUpdatePass = mode === 'update-password'
 
+  const flowCtx = appAuthState.passwordFlowContext
+  const isInviteFlow = isUpdatePass && flowCtx?.flowType === 'invite'
+  const isRecoveryFlow = isUpdatePass && flowCtx?.flowType === 'recovery'
+  const hasIdentityMismatch = Boolean(
+    isUpdatePass &&
+      flowCtx?.verified &&
+      flowCtx?.userId &&
+      appAuthState.user?.id &&
+      String(appAuthState.user.id) !== String(flowCtx.userId)
+  )
+  const isFlowBlocked = Boolean(
+    isUpdatePass &&
+      flowCtx &&
+      (flowCtx.blocked || !flowCtx.verified || hasIdentityMismatch)
+  )
+  const validatedEmail = String(
+    (flowCtx?.verified ? flowCtx?.email : '') || appAuthState.user?.email || ''
+  ).trim()
+
+  const headingTitle = isLogin
+    ? 'Ingresar al taller'
+    : isRegister
+      ? 'Crear cuenta de usuario'
+      : isReset
+        ? 'Recuperar contraseña'
+        : isInviteFlow
+          ? 'Activá tu cuenta'
+          : isRecoveryFlow
+            ? 'Recuperar contraseña'
+            : 'Actualizar contraseña'
+
+  const headingSubtitle = isLogin
+    ? 'Accedé con tu cuenta para gestionar inspecciones, presupuestos y stock de tu taller.'
+    : isRegister
+      ? 'Registrá tus datos para crear tu taller o sumarte a un equipo existente.'
+      : isReset
+        ? 'Te enviaremos un enlace seguro a tu correo electrónico para restablecer tu clave.'
+        : isInviteFlow
+          ? 'Definí tu contraseña segura para activar tu cuenta e ingresar al taller asignado.'
+          : 'Ingresá tu nueva contraseña segura (mínimo 8 caracteres).'
+
   authScreen.innerHTML = `
     <div class="auth-wrapper animate__animated animate__fadeIn">
       <div class="auth-card">
         <div class="section-heading" style="margin-bottom:16px">
           <p class="eyebrow">MITALLERAPP · CRASH SOLUTION</p>
-          <h1 style="font-size:24px;margin-bottom:6px">
-            ${
-              isLogin
-                ? 'Ingresar al taller'
-                : isRegister
-                  ? 'Crear cuenta de usuario'
-                  : isReset
-                    ? 'Recuperar contraseña'
-                    : 'Actualizar contraseña'
-            }
-          </h1>
-          <p class="subtitle">
-            ${
-              isLogin
-                ? 'Accedé con tu cuenta para gestionar inspecciones, presupuestos y stock de tu taller.'
-                : isRegister
-                  ? 'Registrá tus datos para crear tu taller o sumarte a un equipo existente.'
-                  : isReset
-                    ? 'Te enviaremos un enlace seguro a tu correo electrónico para restablecer tu clave.'
-                    : 'Ingresá tu nueva contraseña segura (mínimo 8 caracteres).'
-            }
-          </p>
+          <h1 style="font-size:24px;margin-bottom:6px">${headingTitle}</h1>
+          <p class="subtitle">${headingSubtitle}</p>
         </div>
 
         ${
@@ -560,20 +642,42 @@ function renderAuthScreen() {
 
         ${
           isUpdatePass
-            ? `<form id="updatePassForm" class="auth-form">
-                <label>Nueva contraseña (mínimo 8 caracteres) <span class="required">*</span>
-                  <input id="newPasswordInput" type="password" required minlength="8" autocomplete="new-password" placeholder="Nueva contraseña">
-                </label>
-                <label>Confirmar nueva contraseña <span class="required">*</span>
-                  <input id="confirmNewPasswordInput" type="password" required minlength="8" autocomplete="new-password" placeholder="Repetí la nueva contraseña">
-                </label>
-                <button type="submit" class="button primary" id="updatePassSubmitBtn">Guardar nueva contraseña</button>
+            ? `<form id="updatePassForm" class="auth-form" data-flow-type="${esc(flowCtx?.flowType || 'authenticated')}">
                 ${
-                  appAuthState.user
-                    ? `<div class="auth-links">
-                        <button type="button" class="text-button" id="cancelUpdatePassBtn">← Volver</button>
+                  isInviteFlow || validatedEmail
+                    ? `<div class="activation-account-badge" id="activationAccountInfo" role="status">
+                        <span class="activation-account-label">${
+                          isInviteFlow
+                            ? 'Correo electrónico de la cuenta a activar:'
+                            : 'Cuenta verificada:'
+                        }</span>
+                        <strong id="activationAccountEmail">${esc(
+                          isFlowBlocked
+                            ? 'Sesión de activación no validada'
+                            : validatedEmail || 'Cuenta autenticada'
+                        )}</strong>
                       </div>`
                     : ''
+                }
+                <label>Nueva contraseña <span class="required">*</span>
+                  <input id="newPasswordInput" type="password" required minlength="8" autocomplete="new-password" placeholder="Nueva contraseña (mínimo 8 caracteres)" ${isFlowBlocked ? 'disabled' : ''}>
+                </label>
+                <label>${isInviteFlow ? 'Confirmar contraseña' : 'Confirmar nueva contraseña'} <span class="required">*</span>
+                  <input id="confirmNewPasswordInput" type="password" required minlength="8" autocomplete="new-password" placeholder="Repetí la nueva contraseña" ${isFlowBlocked ? 'disabled' : ''}>
+                </label>
+                <button type="submit" class="button primary" id="updatePassSubmitBtn" ${isFlowBlocked ? 'disabled' : ''}>${
+                  isInviteFlow ? 'Activar cuenta' : 'Guardar nueva contraseña'
+                }</button>
+                ${
+                  isFlowBlocked
+                    ? `<div class="auth-links">
+                        <button type="button" class="text-button" id="backToLoginFromBlockedBtn">← Ir a iniciar sesión</button>
+                      </div>`
+                    : appAuthState.user
+                      ? `<div class="auth-links">
+                          <button type="button" class="text-button" id="cancelUpdatePassBtn">← Volver</button>
+                        </div>`
+                      : ''
                 }
               </form>`
             : ''
@@ -586,7 +690,17 @@ function renderAuthScreen() {
   document.getElementById('tabRegisterBtn')?.addEventListener('click', () => switchAuthMode('register'))
   document.getElementById('goToResetBtn')?.addEventListener('click', () => switchAuthMode('reset'))
   document.getElementById('backToLoginBtn')?.addEventListener('click', () => switchAuthMode('login'))
+  document.getElementById('backToLoginFromBlockedBtn')?.addEventListener('click', () => {
+    appAuthState.passwordFlowContext = null
+    clearCapturedInitialCallback()
+    if (window.location.hash) {
+      window.history.replaceState(null, '', window.location.pathname)
+    }
+    switchAuthMode('login')
+  })
   document.getElementById('cancelUpdatePassBtn')?.addEventListener('click', () => {
+    appAuthState.passwordFlowContext = null
+    clearCapturedInitialCallback()
     leavePasswordScreen()
     renderHeaderNavigation()
   })
@@ -686,21 +800,105 @@ async function handleUpdatePasswordSubmit(e) {
   const btn = document.getElementById('updatePassSubmitBtn')
   const newPass = document.getElementById('newPasswordInput')?.value
   const confirmPass = document.getElementById('confirmNewPasswordInput')?.value
+  const flowCtx = appAuthState.passwordFlowContext
+  const isInviteFlow = flowCtx?.flowType === 'invite'
+  const defaultBtnText = isInviteFlow ? 'Activar cuenta' : 'Guardar nueva contraseña'
+
   setAuthAlert('', '')
+
+  // 1. Bloquear inmediatamente si el contexto de invitación/recuperación fue invalidado o no está verificado
+  if (flowCtx && (flowCtx.blocked || !flowCtx.verified)) {
+    const msg =
+      flowCtx.error ||
+      'No se pudo validar la sesión de la invitación o recuperación. Por seguridad, no se modificó ninguna contraseña.'
+    setAuthAlert('error', msg)
+    return
+  }
+
+  // 2. Verificar que exista sesión autenticada vigente y consistente con el contexto validado
+  if (!appAuthState.user?.id || isSessionExpired(appAuthState.session)) {
+    setAuthAlert(
+      'error',
+      'No hay una sesión de activación o recuperación válida activa. Abrí nuevamente el enlace del correo o iniciá sesión.'
+    )
+    return
+  }
+
+  const expectedUserId = flowCtx?.userId || appAuthState.user.id
+  const expectedEmail = flowCtx?.email || appAuthState.user.email || null
+  const forbiddenUserId =
+    flowCtx?.preExistingUserId && String(flowCtx.preExistingUserId) !== String(expectedUserId)
+      ? String(flowCtx.preExistingUserId)
+      : null
+
+  if (
+    String(appAuthState.user.id) !== String(expectedUserId) ||
+    (forbiddenUserId && String(appAuthState.user.id) === String(forbiddenUserId))
+  ) {
+    setAuthAlert(
+      'error',
+      'Bloqueo de seguridad: la identidad de la sesión activa no coincide con la cuenta de la invitación. No se modificó ninguna contraseña.'
+    )
+    return
+  }
+
   if (btn) {
     btn.disabled = true
-    btn.textContent = 'Actualizando contraseña…'
+    btn.textContent = isInviteFlow ? 'Activando cuenta…' : 'Actualizando contraseña…'
   }
   try {
-    await updateUserPassword(newPass, confirmPass)
-    window.toast?.('Contraseña actualizada con éxito.')
+    const updatedUser = await updateUserPassword(newPass, confirmPass, {
+      expectedUserId,
+      expectedEmail,
+      forbiddenUserId
+    })
+
+    if (updatedUser?.id && String(updatedUser.id) !== String(expectedUserId)) {
+      throw new Error('Inconsistencia de identidad detectada al confirmar la contraseña.')
+    }
+
+    // Si es activación por invitación, verificar perfil, pertenencia al taller y rol asignado
+    if (isInviteFlow) {
+      const targetUser = updatedUser || appAuthState.user
+      const [profile, memberships] = await Promise.all([
+        ensureUserProfile(targetUser).catch(() => appAuthState.profile),
+        fetchUserWorkshops(expectedUserId).catch(() => appAuthState.memberships)
+      ])
+      if (profile) appAuthState.profile = profile
+      if (Array.isArray(memberships) && memberships.length > 0) {
+        appAuthState.memberships = memberships
+        if (!appAuthState.memberships.some(m => m.workshop_id === appAuthState.activeWorkshopId)) {
+          appAuthState.activeWorkshopId = appAuthState.memberships[0].workshop_id
+          localStorage.setItem('mitaller_active_workshop_id', appAuthState.activeWorkshopId)
+        }
+      }
+    }
+
+    if (flowCtx?.tokenFingerprint) {
+      markTokenConsumed(flowCtx.tokenFingerprint)
+    }
+    appAuthState.passwordFlowContext = null
+    clearCapturedInitialCallback()
+
+    const activeMembership = getActiveMembership()
+    const wsName = activeMembership?.workshop?.name || ''
+    const roleLabel = activeMembership?.role ? ROLE_LABELS[activeMembership.role] || activeMembership.role : ''
+    const confirmMsg = isInviteFlow
+      ? wsName
+        ? `Cuenta activada con éxito. Taller asignado: ${wsName}${roleLabel ? ` (${roleLabel})` : ''}.`
+        : 'Cuenta activada con éxito.'
+      : 'Contraseña actualizada con éxito.'
+
+    window.toast?.(confirmMsg)
+    showSuccessToast(confirmMsg)
     await leavePasswordScreen()
+    renderHeaderNavigation()
   } catch (err) {
     setAuthAlert('error', err.message || 'No se pudo actualizar la contraseña.')
   } finally {
-    if (btn) {
+    if (btn && !appAuthState.passwordFlowContext?.blocked) {
       btn.disabled = false
-      btn.textContent = 'Guardar nueva contraseña'
+      btn.textContent = defaultBtnText
     }
   }
 }
@@ -1193,19 +1391,10 @@ export function renderHeaderNavigation() {
   const authenticated = !!appAuthState.user && !isSessionExpired(appAuthState.session)
   navContainer.hidden = !authenticated
   document.querySelectorAll('.header-tools').forEach(el => {
-    el.hidden = !authenticated
-    if (!authenticated) {
-      // Remove session controls from the DOM, including legacy cached markup.
-      el.replaceChildren()
-    } else if (!el.querySelector('#saveState')) {
-      const status = document.createElement('span')
-      status.id = 'saveState'
-      status.setAttribute('role', 'status')
-      status.setAttribute('aria-live', 'polite')
-      status.textContent = window.__saveStateMessage || 'Guardado en este dispositivo'
-      el.append(status)
-    }
+    el.hidden = true
+    el.replaceChildren()
   })
+  document.getElementById('saveState')?.remove()
   if (!authenticated) {
     lastHeaderMarkup = ''
     window.__headerMenuController?.abort()
@@ -1269,13 +1458,8 @@ export function renderHeaderNavigation() {
     </div></div>
   `
   const settingsEl = ensureSettingsScreenElement()
-  if (settingsEl && !settingsEl.querySelector('#navChangePassBtn')) {
+  if (settingsEl && !settingsEl.querySelector('#settingsPasswordForm')) {
     renderSettingsScreen()
-  }
-  const changePassBtn = document.getElementById('navChangePassBtn')
-  if (changePassBtn) {
-    if (currentRoute === 'password') changePassBtn.setAttribute('aria-current', 'page')
-    else changePassBtn.removeAttribute('aria-current')
   }
 
   if (lastHeaderMarkup === markup && navContainer.dataset.navBound === 'true' && navContainer.querySelector('#profileMenuToggle')) return
@@ -1335,10 +1519,6 @@ export function renderHeaderNavigation() {
 
   document.getElementById('navAdminBtn')?.addEventListener('click', () => {
     openAdminScreen()
-  })
-
-  document.getElementById('navChangePassBtn')?.addEventListener('click', () => {
-    navigateAppRoute({ name: 'password' })
   })
 
   document.getElementById('navLogoutBtn')?.addEventListener('click', handleLogout)
@@ -1524,9 +1704,7 @@ export async function syncPendingJobsWithSupabase({ manual = false } = {}) {
     }
   }
 
-  const saveStateEl = document.getElementById('saveState')
   appAuthState.isSyncingOfflineQueue = true
-  if (saveStateEl) saveStateEl.textContent = 'Sincronizando…'
   renderConflictResolutionNotice()
   renderHeaderNavigation()
 
@@ -1544,15 +1722,12 @@ export async function syncPendingJobsWithSupabase({ manual = false } = {}) {
     renderHeaderNavigation()
 
     if (result.conflicts > 0) {
-      if (saveStateEl) saveStateEl.textContent = 'Diferencia por resolver'
       window.toast?.('Se detectó una diferencia con otra edición guardada. Elegí cómo continuar en el aviso superior.')
     } else if (result.failed > 0) {
-      if (saveStateEl) saveStateEl.textContent = 'Guardado en este dispositivo'
       window.toast?.(
         'No se pudo completar la sincronización en este momento. Tus cambios siguen resguardados en este dispositivo.'
       )
     } else if (result.synced > 0) {
-      if (saveStateEl) saveStateEl.textContent = 'Todo sincronizado'
       if (manual) {
         window.toast?.(
           result.synced === 1
@@ -1561,7 +1736,6 @@ export async function syncPendingJobsWithSupabase({ manual = false } = {}) {
         )
       }
     } else if (manual) {
-      if (saveStateEl) saveStateEl.textContent = 'Todo sincronizado'
       window.toast?.('No hay cambios pendientes para sincronizar. Todo está al día.')
     }
 
@@ -1570,7 +1744,6 @@ export async function syncPendingJobsWithSupabase({ manual = false } = {}) {
     appAuthState.isSyncingOfflineQueue = false
     await refreshOfflineQueueStatus()
     renderHeaderNavigation()
-    if (saveStateEl) saveStateEl.textContent = 'Guardado en este dispositivo'
     if (manual) {
       window.toast?.('No se pudo conectar con el servidor. Tus cambios permanecen guardados en este dispositivo.')
     }
@@ -1637,10 +1810,6 @@ async function loadWorkshopJobsUncached() {
   renderHeaderNavigation()
 
   if (!appAuthState.isOnline || !supabase) {
-    const saveStateEl = document.getElementById('saveState')
-    if (saveStateEl) {
-      saveStateEl.textContent = `Modo sin conexión · ${activeMembership.workshop.name}`
-    }
     return
   }
 
@@ -1705,11 +1874,6 @@ async function loadWorkshopJobsUncached() {
     }
     await refreshOfflineQueueStatus()
     renderHeaderNavigation()
-
-    const saveStateEl = document.getElementById('saveState')
-    if (saveStateEl && appAuthState.unresolvedConflicts.length === 0) {
-      saveStateEl.textContent = `Taller: ${activeMembership.workshop.name}`
-    }
   } catch (err) {
     if (String(err?.message || '').toLowerCase().includes('jwt expired')) await handleExpiredSession()
     console.warn('Error al cargar trabajos desde Supabase (usando copia local IndexedDB):', err)
@@ -1734,12 +1898,8 @@ export async function saveActiveJobToSupabase(job) {
     await refreshOfflineQueueStatus()
     renderHeaderNavigation()
 
-    // 2. Si no hay conexión, informar claramente que quedó guardado en la cola local
+    // 2. Si no hay conexión, conservar en la cola local
     if (!appAuthState.isOnline || !supabase) {
-      const saveStateEl = document.getElementById('saveState')
-      if (saveStateEl) {
-        saveStateEl.textContent = `Guardado sin internet (${appAuthState.pendingSyncCount} pend.)`
-      }
       return
     }
 
@@ -3407,10 +3567,6 @@ export async function renderSettingsScreen() {
           <button type="submit" class="button primary" id="settingsUpdatePassBtn">Guardar nueva contraseña</button>
         </form>
 
-        <div class="quiet-details" style="margin-top:16px;padding-top:12px">
-          <button type="button" class="text-button" id="navChangePassBtn">Cambiar contraseña en vista dedicada →</button>
-        </div>
-
         <details class="quiet-details" open>
           <summary>Copia de respaldo (Exportar / Importar)</summary>
           <p class="muted small">Descargá una copia de seguridad de los trabajos o restaurá un archivo guardado previamente.</p>
@@ -3458,10 +3614,6 @@ export async function renderSettingsScreen() {
 
   document.getElementById('backFromSettingsBtn')?.addEventListener('click', () => {
     goBackAppRoute({ name: 'jobs' })
-  })
-
-  document.getElementById('navChangePassBtn')?.addEventListener('click', () => {
-    navigateAppRoute({ name: 'password' })
   })
 
   document.getElementById('settingsPasswordForm')?.addEventListener('submit', async e => {
@@ -3549,6 +3701,20 @@ async function handleExpiredSession() {
 export async function enforceRouteProtection(expiredMessage = '') {
   const authScreen = document.getElementById('authScreen')
   const mainApp = document.getElementById('mainAppContainer')
+  const flowCtx = appAuthState.passwordFlowContext
+
+  if (flowCtx?.blocked) {
+    appAuthState.authMode = 'update-password'
+    if (mainApp) mainApp.hidden = true
+    if (authScreen) {
+      authScreen.hidden = false
+      renderAuthScreen()
+      setAuthAlert('error', expiredMessage || flowCtx.error || 'El enlace de invitación o recuperación no es válido o expiró.')
+    }
+    renderHeaderNavigation()
+    return
+  }
+
   const hasValidSession = appAuthState.session && !isSessionExpired(appAuthState.session)
   if (!hasValidSession) {
     if (appAuthState.authMode === 'update-password') appAuthState.authMode = 'login'
@@ -3713,6 +3879,22 @@ function syncActiveJobFromDom() {
   if (!j.pieceQuotes || typeof j.pieceQuotes !== 'object' || Array.isArray(j.pieceQuotes)) {
     j.pieceQuotes = {}
   }
+
+  // Sincronizar campos manuales del modo resumido si están presentes en el DOM
+  const summaryEls = document.querySelectorAll('#quoteLines [data-summary-field]')
+  if (summaryEls.length > 0) {
+    if (!j.summaryBudget || typeof j.summaryBudget !== 'object' || Array.isArray(j.summaryBudget)) {
+      j.summaryBudget = { chapaDays: 0, chapaDayPrice: 0, pinturaPanels: 0, pinturaPanelPrice: 0 }
+    }
+    summaryEls.forEach(el => {
+      const sField = el.dataset.summaryField
+      if (sField) {
+        j.summaryBudget[sField] = Math.max(0, Number(el.value) || 0)
+      }
+    })
+    j.summaryBudget = normalizeSummaryBudget(j.summaryBudget)
+  }
+
   const lineEls = document.querySelectorAll('#quoteLines [data-line][data-field]')
   lineEls.forEach(el => {
     const idx = Number(el.dataset.line)
@@ -3742,16 +3924,45 @@ function syncActiveJobFromDom() {
     }
   })
 
-  // Si existen renglones válidos con descripción y cantidad > 0, eliminar renglones extra en blanco que bloqueen la entrega
+  // Si existen renglones válidos con descripción y cantidad > 0 (o datos en modo resumido),
+  // eliminar renglones manuales extra en blanco que bloqueen la entrega, sin borrar nunca piezas de inspección.
+  const mode = resolveBudgetMode(j)
+  const sb = normalizeSummaryBudget(j.summaryBudget)
+  const hasSummaryValues = mode === 'summary' && (sb.chapaDays > 0 || sb.pinturaPanels > 0)
   const validLines = j.quote.filter(q => String(q?.description || '').trim() && (Number(q?.qty) || 0) > 0)
-  if (validLines.length > 0 && validLines.length < j.quote.length) {
-    j.quote = j.quote.filter(q => String(q?.description || '').trim() || (Number(q?.price) || 0) > 0)
-    window.renderBudget?.()
+  if ((validLines.length > 0 || hasSummaryValues) && validLines.length < j.quote.length) {
+    const nextQuote = j.quote.filter(q => {
+      const info = describeQuoteLine(q)
+      if (info.isInspectionPiece) return true
+      return Boolean(String(q?.description || '').trim() || (Number(q?.price) || 0) > 0)
+    })
+    if (nextQuote.length !== j.quote.length) {
+      j.quote = nextQuote
+      window.renderBudget?.()
+    }
   }
 
   if (!j.document) j.document = {}
+  const activePaintBtn = document.querySelector('#paintTypeSection [data-paint-type][aria-pressed="true"], #paintTypeSection .paint-pill.active[data-paint-type]')
+  const paintTypeEl = document.getElementById('paintType')
+  if (activePaintBtn) {
+    const pt = normalizePaintType(activePaintBtn.getAttribute('data-paint-type'))
+    j.paintType = pt
+    j.document.paintType = pt
+  } else if (paintTypeEl) {
+    const pt = normalizePaintType(paintTypeEl.value)
+    j.paintType = pt
+    j.document.paintType = pt
+  } else if (document.getElementById('paintTypeSection')) {
+    const pt = normalizePaintType(j.paintType ?? j.document?.paintType ?? '')
+    j.paintType = pt
+    j.document.paintType = pt
+  }
   const termsEl = document.getElementById('terms')
-  if (termsEl && termsEl.value) j.document.terms = termsEl.value
+  if (termsEl && termsEl.value) {
+    j.document.terms = termsEl.value
+    j.observations = termsEl.value
+  }
   const discountEl = document.getElementById('discount')
   if (discountEl && discountEl.value !== '') j.discount = Math.max(0, Number(discountEl.value) || 0)
   const taxEl = document.getElementById('tax')
@@ -3774,6 +3985,7 @@ function validateBudgetBeforeAction() {
     return false
   }
 
+  const mode = resolveBudgetMode(j)
   const valid = Boolean(window.quoteValid?.())
   if (!valid) {
     const noticeEl = document.getElementById('notice')
@@ -3783,6 +3995,16 @@ function validateBudgetBeforeAction() {
         reason = 'Completá el nombre del cliente en el Paso 1 (Recepción) antes de entregar el presupuesto.'
       } else if (!String(j.rec?.patente || '').trim()) {
         reason = 'Completá la patente del vehículo en el Paso 1 (Recepción) antes de entregar el presupuesto.'
+      } else if (mode === 'summary') {
+        const sb = normalizeSummaryBudget(j.summaryBudget)
+        const manualLines = (Array.isArray(j.quote) ? j.quote : []).filter(q => !describeQuoteLine(q).isInspectionPiece)
+        if (!sb.chapaDays && !sb.pinturaPanels && !manualLines.length) {
+          reason = 'En el modo resumido, ingresá los días de chapa, paños de pintura o agregá al menos un repuesto o trabajo.'
+        } else if (manualLines.some(q => !String(q?.description || '').trim() || !(Number(q?.qty) > 0))) {
+          reason = 'Completá la descripción y una cantidad mayor a 0 en cada repuesto u otro trabajo.'
+        } else {
+          reason = 'Se canceló la entrega porque hay tarifas o trabajos con precio $ 0.'
+        }
       } else if (!Array.isArray(j.quote) || !j.quote.length) {
         reason = 'Agregá al menos un trabajo o repuesto al presupuesto antes de descargarlo o enviarlo.'
       } else if (j.quote.some(q => !String(q?.description || '').trim() || !(Number(q?.qty) > 0))) {
@@ -3905,9 +4127,14 @@ export function wireNavigationPersistence() {
     window.openJob = function (id, step) {
       prepareBudgetDelivery().catch(() => {})
       const target = window.store?.jobs?.find(job => job.id === id)
+      const targetHasBudget = Boolean(
+        target?.quote?.length ||
+          Number(target?.summaryBudget?.chapaDays) > 0 ||
+          Number(target?.summaryBudget?.pinturaPanels) > 0
+      )
       const resolvedStep =
         step ||
-        (target?.quote?.length
+        (targetHasBudget
           ? 'budget'
           : target?.inspection && Object.keys(target.inspection).length
             ? 'inspection'
@@ -4176,7 +4403,10 @@ export function wireEnhancedBudgetAndSettings() {
       const safeDateFn = typeof window.safeDate === 'function' ? window.safeDate : v => String(v || '')
       const expiryFn = typeof window.expiry === 'function' ? window.expiry : dObj => String(dObj?.date || '')
       const moneyFn = typeof window.money === 'function' ? window.money : v => `$ ${Number(v || 0)}`
-      const t = computeDetailedBudgetTotals(j)
+      const mode = resolveBudgetMode(j)
+      const paintType = resolvePaintType(j)
+      const observationsText = resolveBudgetObservations(j)
+      const t = computeBudgetTotalsByMode(j, mode)
       const d = j.document || {}
       const quoteRef = j.number?.startsWith('LOCAL-') ? `Referencia ${j.id.slice(0, 8)}` : j.number
       const headerHtml = buildBudgetWorkshopHeaderHtml(
@@ -4185,6 +4415,25 @@ export function wireEnhancedBudgetAndSettings() {
         safeDateFn(d.date),
         safeDateFn(expiryFn(d))
       )
+
+      const rowsHtml =
+        mode === 'summary'
+          ? buildSummaryPresentationLines(j)
+              .map(
+                row =>
+                  `<tr><td>${esc(row.displayDescription)}</td><td>${esc(row.qtyWithUnit)}</td><td>${moneyFn(
+                    row.price
+                  )}</td><td>${moneyFn(row.subtotal)}</td></tr>`
+              )
+              .join('')
+          : (j.quote || [])
+              .map(q => {
+                const info = describeQuoteLine(q)
+                return `<tr><td>${esc(info.displayDescription)}</td><td>${esc(info.qtyWithUnit)}</td><td>${moneyFn(
+                  info.price
+                )}</td><td>${moneyFn(info.subtotal)}</td></tr>`
+              })
+              .join('')
 
       const printDoc = document.getElementById('printDocument')
       if (printDoc) {
@@ -4200,35 +4449,50 @@ export function wireEnhancedBudgetAndSettings() {
             <div>
               <h3>Vehículo</h3>
               <p><b>${esc([j.rec.marca, j.rec.modelo].filter(Boolean).join(' '))}${j.rec.anio ? ` (${esc(j.rec.anio)})` : ''}</b></p>
-              <p>Patente: <b>${esc((j.rec.patente || '').toUpperCase())}</b>${j.rec.anio ? ` · Año: <b>${esc(j.rec.anio)}</b>` : ''}</p>
+              <p>Patente: <b>${esc((j.rec.patente || '').toUpperCase())}</b>${j.rec.anio ? ` · Año: <b>${esc(j.rec.anio)}</b>` : ''}${paintType ? ` · Pintura: <b>${esc(paintType)}</b>` : ''}</p>
               <p>${j.rec.km ? `Kilometraje: ${esc(j.rec.km)} km` : ''}</p>
             </div>
           </div>
           <table class="pdf-table">
             <thead>
-              <tr><th>Pieza / Intervención</th><th>Cant. / Unid.</th><th>Precio unit.</th><th>Subtotal</th></tr>
+              <tr><th>${mode === 'summary' ? 'Concepto / Trabajo' : 'Pieza / Intervención'}</th><th>Cant. / Unid.</th><th>Precio unit.</th><th>Subtotal</th></tr>
             </thead>
             <tbody>
-              ${(j.quote || [])
-                .map(q => {
-                  const info = describeQuoteLine(q)
-                  return `<tr><td>${esc(info.displayDescription)}</td><td>${esc(info.qtyWithUnit)}</td><td>${moneyFn(
-                    info.price
-                  )}</td><td>${moneyFn(info.subtotal)}</td></tr>`
-                })
-                .join('')}
+              ${rowsHtml}
             </tbody>
           </table>
           <div class="pdf-total">
-            ${t.chapaCount > 0 || t.chapaSubtotal > 0 ? `<div><span>Resumen Chapa (${t.chapaDays} días)</span><b>${moneyFn(t.chapaSubtotal)}</b></div>` : ''}
-            ${t.pinturaCount > 0 || t.pinturaSubtotal > 0 ? `<div><span>Resumen Pintura (${t.pinturaPanels} paños)</span><b>${moneyFn(t.pinturaSubtotal)}</b></div>` : ''}
+            ${paintType ? `<div><span>Tipo de pintura</span><b>${esc(paintType)}</b></div>` : ''}
+            ${t.chapaCount > 0 || t.chapaSubtotal > 0 ? `<div><span>Resumen Chapa (${formatArQuantity(t.chapaDays)} días)</span><b>${moneyFn(t.chapaSubtotal)}</b></div>` : ''}
+            ${t.pinturaCount > 0 || t.pinturaSubtotal > 0 ? `<div><span>Resumen Pintura (${formatArQuantity(t.pinturaPanels)} paños)</span><b>${moneyFn(t.pinturaSubtotal)}</b></div>` : ''}
             ${t.otherSubtotal > 0 && (t.chapaCount > 0 || t.pinturaCount > 0) ? `<div><span>Otros trabajos / repuestos</span><b>${moneyFn(t.otherSubtotal)}</b></div>` : ''}
             <div><span>Subtotal</span><b>${moneyFn(t.subtotal)}</b></div>
             ${t.discount ? `<div><span>Descuento</span><b>- ${moneyFn(t.discount)}</b></div>` : ''}
             ${t.tax ? `<div><span>Impuesto</span><b>${moneyFn(t.tax)}</b></div>` : ''}
             <div class="pdf-grand"><span>Total</span><b>${moneyFn(t.total)}</b></div>
           </div>
-          ${d.terms ? `<div class="pdf-terms"><b>Condiciones y observaciones</b><p>${esc(d.terms)}</p></div>` : ''}
+          ${
+            observationsText || paintType
+              ? `<div class="pdf-terms"><b>Condiciones y observaciones</b><p>${esc(
+                  [paintType ? `Sistema de pintura del vehículo: ${paintType}.` : '', observationsText]
+                    .filter(Boolean)
+                    .join('\n')
+                )}</p></div>`
+              : ''
+          }
+          <div class="pdf-signature">
+            <div class="pdf-signature-space">
+              ${
+                shop.signature_url && /^data:image\/(png|jpeg|jpg|webp)/i.test(shop.signature_url)
+                  ? `<img src="${esc(shop.signature_url)}" alt="Firma del taller" style="max-height:38px;max-width:140px;object-fit:contain">`
+                  : ''
+              }
+            </div>
+            <div class="pdf-signature-line">
+              <b>FIRMA Y SELLO DEL TALLER EMISOR</b>
+              <div>${esc([shop.name || 'Crash Solution', shop.legal_name, shop.tax_id ? `CUIT ${shop.tax_id}` : ''].filter(Boolean).join(' · '))}</div>
+            </div>
+          </div>
           <p class="pdf-footer">
             ${esc(
               [
@@ -4263,7 +4527,25 @@ export function wireEnhancedBudgetAndSettings() {
 }
 
 export async function initAuthAndAdmin() {
-  initialRecoveryRequested = initialRecoveryRequested || isPasswordSetupCallback(window.location)
+  const liveCallback = parseAuthCallbackUrl(window.location)
+  const capturedCallback = getCapturedInitialCallback()
+  const callbackInfo = liveCallback.isAuthCallback
+    ? {
+        ...liveCallback,
+        preExistingUserId:
+          appAuthState.user?.id ||
+          capturedCallback?.preExistingUserId ||
+          readStoredSupabaseSessionUser()?.userId ||
+          null
+      }
+    : capturedCallback?.isAuthCallback
+      ? {
+          ...capturedCallback,
+          preExistingUserId: appAuthState.user?.id || capturedCallback.preExistingUserId || null
+        }
+      : liveCallback
+
+  initialRecoveryRequested = initialRecoveryRequested || Boolean(callbackInfo.isPasswordSetupFlow)
   wireEnhancedBudgetAndSettings()
 
   if (!isSupabaseConfigured || !supabase) {
@@ -4286,8 +4568,68 @@ export async function initAuthAndAdmin() {
     }
   }
 
+  // Si se abrió un enlace de invitación o recuperación mientras había otro usuario conectado en memoria,
+  // aislar de inmediato la sesión anterior antes de resolver la nueva identidad.
+  const preExistingUserId = callbackInfo.preExistingUserId || appAuthState.user?.id || null
+  if (callbackInfo.isAuthCallback && preExistingUserId && appAuthState.user?.id === preExistingUserId) {
+    const prevMembership = getActiveMembership()
+    await lockOfflineDataOnLogout({
+      userId: preExistingUserId,
+      workshopId: prevMembership?.workshop_id || null
+    }).catch(() => {})
+    privateReadCache.clear()
+    clearWorkshopReadState()
+    clearNavigationState()
+    appAuthState.session = null
+    appAuthState.user = null
+    appAuthState.profile = null
+    appAuthState.memberships = []
+    appAuthState.activeWorkshopProfile = null
+    appAuthState.isSessionBootstrapped = false
+  }
+
+  if (callbackInfo.isAuthCallback) {
+    appAuthState.passwordFlowContext = {
+      flowType: callbackInfo.type === 'recovery' ? 'recovery' : 'invite',
+      verified: false,
+      blocked: false,
+      pending: true,
+      userId: null,
+      email: callbackInfo.jwtClaims?.email || '',
+      preExistingUserId,
+      callbackInfo
+    }
+  }
+
   const { data, error } = await supabase.auth.getSession()
-  if (error) {
+
+  if (callbackInfo.isAuthCallback) {
+    const verification = await establishAndVerifyCallbackSession({
+      supabaseClient: supabase,
+      callbackInfo,
+      currentSession: data?.session || null,
+      preExistingUserId
+    })
+
+    if (verification.blocked) {
+      appAuthState.passwordFlowContext = verification
+      appAuthState.session = null
+      appAuthState.user = null
+      initialRecoveryRequested = false
+      await enforceRouteProtection(verification.error)
+    } else if (verification.ok && verification.verified) {
+      appAuthState.passwordFlowContext = { ...verification, callbackInfo }
+      initialRecoveryRequested = true
+      await onSessionEstablished(verification.session)
+    } else {
+      appAuthState.passwordFlowContext = {
+        ...verification,
+        callbackInfo,
+        preExistingUserId
+      }
+      await enforceRouteProtection()
+    }
+  } else if (error) {
     await enforceRouteProtection(translateAuthError(error))
   } else if (data?.session) {
     if (isSessionExpired(data.session)) {
@@ -4306,6 +4648,37 @@ export async function initAuthAndAdmin() {
 
   supabase.auth.onAuthStateChange(async (event, session) => {
     if (event === 'PASSWORD_RECOVERY') {
+      const prevId = appAuthState.passwordFlowContext?.preExistingUserId || appAuthState.user?.id || null
+      if (prevId && session?.user?.id && String(prevId) !== String(session.user.id)) {
+        privateReadCache.clear()
+        clearWorkshopReadState()
+        clearNavigationState()
+      }
+      if (!session?.user?.id || isSessionExpired(session)) {
+        appAuthState.passwordFlowContext = {
+          flowType: 'recovery',
+          verified: false,
+          blocked: true,
+          errorCode: 'RECOVERY_INVALID',
+          error: 'El enlace de recuperación expiró o no es válido. Por seguridad, no se modificó ninguna contraseña.'
+        }
+        appAuthState.session = null
+        appAuthState.user = null
+        initialRecoveryRequested = false
+        await enforceRouteProtection(appAuthState.passwordFlowContext.error)
+        return
+      }
+      appAuthState.passwordFlowContext = {
+        ok: true,
+        verified: true,
+        blocked: false,
+        flowType: 'recovery',
+        userId: String(session.user.id),
+        email: String(session.user.email || '').trim().toLowerCase(),
+        accessToken: session.access_token,
+        tokenFingerprint: computeTokenFingerprint(session.access_token),
+        preExistingUserId: prevId && String(prevId) !== String(session.user.id) ? String(prevId) : null
+      }
       appAuthState.session = session
       appAuthState.user = session?.user || null
       initialRecoveryRequested = true
@@ -4316,6 +4689,8 @@ export async function initAuthAndAdmin() {
       privateReadCache.clear()
       clearWorkshopReadState()
       appAuthState.authMode = 'login'
+      appAuthState.passwordFlowContext = null
+      clearCapturedInitialCallback()
       const prevUserId = appAuthState.user?.id || null
       const activeMembership = getActiveMembership()
       await lockOfflineDataOnLogout({
@@ -4343,6 +4718,32 @@ export async function initAuthAndAdmin() {
       return
     }
     if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED' || event === 'USER_UPDATED') {
+      const activeCallbackInfo =
+        appAuthState.passwordFlowContext?.callbackInfo ||
+        (parseAuthCallbackUrl(window.location).isAuthCallback ? parseAuthCallbackUrl(window.location) : null)
+
+      if (activeCallbackInfo && (appAuthState.passwordFlowContext?.pending || isPasswordSetupCallback(window.location))) {
+        const verification = await establishAndVerifyCallbackSession({
+          supabaseClient: supabase,
+          callbackInfo: activeCallbackInfo,
+          currentSession: session,
+          preExistingUserId: appAuthState.passwordFlowContext?.preExistingUserId || null
+        })
+        if (verification.blocked) {
+          appAuthState.passwordFlowContext = verification
+          appAuthState.session = null
+          appAuthState.user = null
+          initialRecoveryRequested = false
+          await enforceRouteProtection(verification.error)
+          return
+        }
+        if (verification.ok && verification.verified) {
+          appAuthState.passwordFlowContext = { ...verification, callbackInfo: activeCallbackInfo }
+          initialRecoveryRequested = true
+          session = verification.session
+        }
+      }
+
       const shouldReinit = shouldReinitializeOnAuthEvent({
         event,
         previousUserId: appAuthState.user?.id || null,
@@ -4351,7 +4752,7 @@ export async function initAuthAndAdmin() {
       })
       appAuthState.session = session
       appAuthState.user = session?.user || appAuthState.user
-      if (shouldReinit) {
+      if (shouldReinit || initialRecoveryRequested) {
         await onSessionEstablished(session)
       }
     }
@@ -4364,10 +4765,6 @@ export async function initAuthAndAdmin() {
       appAuthState.isOnline = false
       await refreshOfflineQueueStatus()
       renderHeaderNavigation()
-      const saveStateEl = document.getElementById('saveState')
-      if (saveStateEl) {
-        saveStateEl.textContent = 'Sin internet · Guardando localmente'
-      }
       window.toast?.('Se perdió la conexión a Internet. Podés seguir trabajando; los cambios se guardan en este dispositivo.')
     })
 
