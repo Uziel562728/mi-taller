@@ -1,4 +1,9 @@
 import { createClient } from '@supabase/supabase-js'
+import { prepareInitialAuthCallbackInWindow } from './auth-callback.js'
+
+if (typeof window !== 'undefined') {
+  prepareInitialAuthCallbackInWindow(window, window.localStorage)
+}
 
 const supabaseUrl =
   import.meta.env?.VITE_SUPABASE_URL ||

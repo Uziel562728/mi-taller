@@ -69,7 +69,8 @@ async function at(hash, screen) {
       expect(document.getElementById('mainAppContainer').hidden).toBe(true)
       expect(document.getElementById('updatePassForm')).not.toBeNull()
       expect(document.querySelector('.primary-navigation [aria-current="page"]')).toBeNull()
-      expect(document.getElementById('navChangePassBtn').getAttribute('aria-current')).toBe('page')
+      expect(document.getElementById('navSettingsBtn').getAttribute('aria-current')).toBe('page')
+      expect(document.getElementById('navChangePassBtn')).toBeNull()
     } else {
       expect(document.getElementById('authScreen').hidden).toBe(true)
       expect(document.getElementById('updatePassForm')).toBeNull()
@@ -131,7 +132,7 @@ describe('Historial integrado con URL, autenticación y sección visible', () =>
   it('Atrás y Adelante reproducen Admin → contraseña → Trabajos sin encabezados desfasados', async () => {
     await enforceRouteProtection()
     click('navAdminBtn'); await at('#/admin', 'admin')
-    click('navChangePassBtn'); await at('#update-password', 'password')
+    await navigateAppRoute({ name: 'password' }); await at('#update-password', 'password')
     click('navJobsBtn'); await at('#/trabajos', 'jobs')
     history.back(); await at('#update-password', 'password')
     history.back(); await at('#/admin', 'admin')
@@ -173,7 +174,7 @@ describe('Historial integrado con URL, autenticación y sección visible', () =>
     document.getElementById('mapDisclosure').open = false
     persistCurrentNavigationState()
     const job = window.active
-    click('navChangePassBtn'); await at('#update-password', 'password')
+    await navigateAppRoute({ name: 'password' }); await at('#update-password', 'password')
     click('navJobsBtn'); await at('#/trabajos', 'jobs')
     history.back(); await at('#update-password', 'password')
     history.back(); await at('#/trabajos/job-1/inspection', 'work')
@@ -209,7 +210,7 @@ describe('Historial integrado con URL, autenticación y sección visible', () =>
   it('F5 en contraseña conserva la ruta y Volver regresa a la sección anterior sin crear entradas', async () => {
     await enforceRouteProtection()
     click('navStockBtn'); await at('#/stock', 'stock')
-    click('navChangePassBtn'); await at('#update-password', 'password')
+    await navigateAppRoute({ name: 'password' }); await at('#update-password', 'password')
     const length = history.length
     resetAppRouter(); appAuthState.authMode = 'login'
     await enforceRouteProtection()
@@ -240,7 +241,7 @@ describe('Historial integrado con URL, autenticación y sección visible', () =>
 
   it('logout desde contraseña limpia el formulario; Atrás no expone pantallas de sesión', async () => {
     await enforceRouteProtection()
-    click('navChangePassBtn'); await at('#update-password', 'password')
+    await navigateAppRoute({ name: 'password' }); await at('#update-password', 'password')
     click('navLogoutBtn')
     await vi.waitFor(() => expect(appAuthState.user).toBeNull())
     expect(document.getElementById('loginForm')).not.toBeNull()

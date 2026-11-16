@@ -1,5 +1,6 @@
 import { supabase } from './supabase.js'
 import { applicationUrl } from './app-url.js'
+import { parseAuthCallbackUrl } from './auth-callback.js'
 
 const messages = {
   AUTH_REQUIRED: 'Iniciá sesión para realizar esta operación.',
@@ -133,5 +134,6 @@ export function buildInvitationRedirect(location = globalThis.window?.location, 
 }
 
 export function isPasswordSetupCallback(location) {
-  return ['invite', 'recovery'].includes(new URLSearchParams(location.hash.slice(1)).get('type'))
+  const parsed = parseAuthCallbackUrl(location)
+  return parsed.isPasswordSetupFlow
 }

@@ -318,16 +318,55 @@ export async function sendPasswordReset(email) {
   return true
 }
 
-export async function updateUserPassword(newPassword, confirmPassword) {
-  if (!isSupabaseConfigured || !supabase) {
+export async function updateUserPassword(newPassword, confirmPassword, options = {}) {
+  const client = options.client || supabase
+  if (!client && !isSupabaseConfigured) {
     throw new Error('Supabase no está configurado.')
   }
   const check = validatePasswordUpdate(newPassword, confirmPassword)
   if (!check.valid) throw new Error(check.error)
 
-  const { data, error } = await supabase.auth.updateUser({
+  const { expectedUserId = null, expectedEmail = null, forbiddenUserId = null } = options
+
+  // Verificar aislamiento de identidad en la sesión activa antes de ejecutar updateUser
+  if (typeof client?.auth?.getSession === 'function') {
+    const { data: sessionData, error: sessionErr } = await client.auth.getSession()
+    if (sessionErr) throw new Error(translateAuthError(sessionErr))
+    const activeUser = sessionData?.session?.user || null
+
+    if (activeUser?.id) {
+      if (expectedUserId && String(activeUser.id) !== String(expectedUserId)) {
+        throw new Error(
+          'Bloqueo de seguridad: la sesión actual no coincide con la cuenta que se está activando o recuperando. No se modificó ninguna contraseña.'
+        )
+      }
+
+      if (forbiddenUserId && String(activeUser.id) === String(forbiddenUserId)) {
+        throw new Error(
+          'Bloqueo de seguridad: se detectó una sesión previa activa de otro usuario. Por seguridad, no se permitió modificar la contraseña.'
+        )
+      }
+
+      if (
+        expectedEmail &&
+        activeUser.email &&
+        String(activeUser.email).trim().toLowerCase() !== String(expectedEmail).trim().toLowerCase()
+      ) {
+        throw new Error(
+          'Bloqueo de seguridad: el correo electrónico de la sesión activa no coincide con la cuenta validada.'
+        )
+      }
+    }
+  }
+
+  const { data, error } = await client.auth.updateUser({
     password: String(newPassword)
   })
   if (error) throw new Error(translateAuthError(error))
-  return data.user
+
+  if (expectedUserId && data?.user?.id && String(data.user.id) !== String(expectedUserId)) {
+    throw new Error('No se pudo confirmar la actualización de contraseña para la cuenta indicada.')
+  }
+
+  return data?.user || null
 }
