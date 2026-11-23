@@ -12,9 +12,13 @@ import {
   getCapturedInitialCallback,
   clearCapturedInitialCallback,
   establishAndVerifyCallbackSession,
+  verifyEmailChangeCallback,
   markTokenConsumed,
   isTokenAlreadyConsumed,
-  clearConsumedTokens
+  clearConsumedTokens,
+  recordPendingEmailChange,
+  readPendingEmailChange,
+  clearPendingEmailChange
 } from './lib/auth-callback.js'
 import { fetchAllPages } from './lib/paged-query.js'
 import { supabase, isSupabaseConfigured } from './lib/supabase.js'
@@ -29,6 +33,8 @@ import {
   signOutUser,
   sendPasswordReset,
   updateUserPassword,
+  requestUserEmailChange,
+  validateEmailChange,
   translateAuthError
 } from './lib/auth.js'
 import {
@@ -157,7 +163,9 @@ export {
   establishAndVerifyCallbackSession,
   markTokenConsumed,
   isTokenAlreadyConsumed,
-  clearConsumedTokens
+  clearConsumedTokens,
+  requestUserEmailChange,
+  validateEmailChange
 }
 
 if (typeof window !== 'undefined') {
@@ -243,6 +251,115 @@ let pendingSessionInitialization = null
 let jobsLoadPromise = null
 let jobsLoadScope = null
 let lastHeaderMarkup = ''
+let headerBrandVersion = 0
+
+const DEFAULT_GENERIC_SHOP = Object.freeze({
+  id: null,
+  name: 'Crash Solution',
+  legal_name: '',
+  tax_id: '',
+  logo_path: '',
+  logo_url: '',
+  phone: '',
+  whatsapp: '',
+  email: '',
+  address: ''
+})
+
+function isSafeLogoUrl(url) {
+  const clean = String(url || '').trim()
+  if (!clean) return false
+  return /^data:image\/(png|jpeg|jpg|webp|svg\+xml);/i.test(clean) || /^https?:\/\//i.test(clean)
+}
+
+export function renderHeaderBrand({ forceGeneric = false, workshop = null } = {}) {
+  if (typeof document === 'undefined') return
+  const brandEl = document.getElementById('appHeaderBrand') || document.querySelector('.app-header .brand, .brand')
+  if (!brandEl) return
+
+  const markEl =
+    document.getElementById('headerBrandMark') ||
+    brandEl.querySelector('.brand-mark') ||
+    brandEl.querySelector('span:first-child')
+  const copyEl =
+    document.getElementById('headerBrandCopy') ||
+    brandEl.querySelector('.brand-copy') ||
+    brandEl.querySelector('span:nth-child(2)')
+
+  const authenticated =
+    !forceGeneric &&
+    Boolean(appAuthState.user) &&
+    !isSessionExpired(appAuthState.session) &&
+    !appAuthState.passwordFlowContext?.blocked
+
+  const ws = authenticated ? workshop || appAuthState.activeWorkshopProfile || getActiveMembership()?.workshop || null : null
+
+  if (!authenticated || !ws) {
+    brandEl.setAttribute('data-brand-mode', 'generic')
+    brandEl.removeAttribute('data-workshop-id')
+    if (markEl) {
+      markEl.classList.remove('has-workshop-logo')
+      markEl.setAttribute('data-brand-mode', 'generic')
+      markEl.removeAttribute('data-workshop-id')
+      markEl.textContent = 'ϟ'
+    }
+    if (copyEl) {
+      copyEl.innerHTML = 'CRASH SOLUTION<small>MiTallerAPP</small>'
+    }
+    return
+  }
+
+  const wsId = String(ws.id || '')
+  const wsName = String(ws.name || 'Crash Solution').trim() || 'Crash Solution'
+  const wsSubtitle = String(ws.legal_name || 'Gestión del taller').trim() || 'Gestión del taller'
+  const logoUrl = isSafeLogoUrl(ws.logo_url) ? String(ws.logo_url).trim() : ''
+
+  brandEl.setAttribute('data-brand-mode', 'workshop')
+  if (wsId) brandEl.setAttribute('data-workshop-id', wsId)
+  else brandEl.removeAttribute('data-workshop-id')
+
+  if (markEl) {
+    if (wsId) markEl.setAttribute('data-workshop-id', wsId)
+    else markEl.removeAttribute('data-workshop-id')
+
+    if (logoUrl) {
+      markEl.classList.add('has-workshop-logo')
+      markEl.setAttribute('data-brand-mode', 'workshop')
+      const existingImg = markEl.querySelector('#headerWorkshopLogo')
+      if (!existingImg || existingImg.getAttribute('src') !== logoUrl) {
+        markEl.innerHTML = `<img id="headerWorkshopLogo" class="brand-logo-img" src="${esc(logoUrl)}" alt="Logo de ${esc(wsName)}">`
+        const imgEl = markEl.querySelector('#headerWorkshopLogo')
+        imgEl?.addEventListener(
+          'error',
+          () => {
+            markEl.classList.remove('has-workshop-logo')
+            markEl.setAttribute('data-brand-mode', 'workshop-fallback')
+            markEl.textContent = 'ϟ'
+          },
+          { once: true }
+        )
+      } else {
+        existingImg.alt = `Logo de ${wsName}`
+      }
+    } else {
+      markEl.classList.remove('has-workshop-logo')
+      markEl.setAttribute('data-brand-mode', 'workshop-fallback')
+      markEl.textContent = 'ϟ'
+    }
+  }
+
+  if (copyEl) {
+    copyEl.innerHTML = `${esc(wsName.toUpperCase())}<small>${esc(wsSubtitle)}</small>`
+  }
+}
+
+export function resetHeaderBrandToGeneric() {
+  headerBrandVersion++
+  if (typeof window !== 'undefined' && window.store) {
+    window.store.shop = { ...DEFAULT_GENERIC_SHOP }
+  }
+  renderHeaderBrand({ forceGeneric: true })
+}
 function prepareBudgetDelivery() {
   if (budgetDeliveryModule) return Promise.resolve(budgetDeliveryModule)
   budgetDeliveryModule = budgetDeliveryStaticModule
@@ -569,6 +686,13 @@ function renderAuthScreen() {
   authScreen.innerHTML = `
     <div class="auth-wrapper animate__animated animate__fadeIn">
       <div class="auth-card">
+        <div class="auth-public-brand" id="authPublicBrand" data-brand-mode="generic">
+          <span class="brand-mark auth-brand-mark" aria-hidden="true">ϟ</span>
+          <div class="auth-public-brand-text">
+            <strong>Crash Solution</strong>
+            <span>MiTallerAPP · Portal de talleres</span>
+          </div>
+        </div>
         <div class="section-heading" style="margin-bottom:16px">
           <p class="eyebrow">MITALLERAPP · CRASH SOLUTION</p>
           <h1 style="font-size:24px;margin-bottom:6px">${headingTitle}</h1>
@@ -924,6 +1048,8 @@ export async function handleLogout() {
       userId: prevUserId,
       workshopId: activeMembership?.workshop_id || null
     })
+    resetHeaderBrandToGeneric()
+    clearPendingEmailChange()
     clearWorkshopReadState()
     clearNavigationState()
     if (window.store) {
@@ -931,18 +1057,21 @@ export async function handleLogout() {
       window.store.activeId = null
     }
     window.active = null
+    appAuthState.activeWorkshopId = null
+    appAuthState.activeWorkshopProfile = null
+    localStorage.removeItem('mitaller_active_workshop_id')
     await signOutUser()
     appAuthState.authMode = 'login'
     appAuthState.session = null
     appAuthState.user = null
     appAuthState.profile = null
     appAuthState.memberships = []
-    appAuthState.activeWorkshopProfile = null
     appAuthState.isSessionBootstrapped = false
     appAuthState.pendingSyncCount = 0
     appAuthState.unresolvedConflicts = []
     appAuthState.activePieceKey = null
     appAuthState.openPieceDetailsKeys = []
+    renderHeaderNavigation()
     window.toast?.('Sesión cerrada. Los cambios pendientes quedaron resguardados en este dispositivo hasta tu próximo ingreso.')
     routeInitializedFor = null
     await getAppRouter().navigate({ name: 'jobs' }, { replace: true })
@@ -1278,47 +1407,65 @@ export function openMyProfile() {
   const mailIcon = icon('<rect x="3" y="5" width="18" height="14" rx="3"/><path d="m3 7 9 6 9-6"/>')
   const shopIcon = icon('<path d="M3 21h18M5 21V8l7-5 7 5v13M9 21v-7h6v7"/>')
   const editIcon = icon('<path d="m15 5 4 4M4 20l4-1L20 7a2.8 2.8 0 0 0-4-4L4 15z"/>')
+  const returnFocusTarget = document.activeElement instanceof HTMLElement ? document.activeElement : null
   const dialog = document.createElement('dialog')
   dialog.id = 'myProfileDialog'
   dialog.className = 'personal-profile-dialog'
+  dialog.setAttribute('aria-modal', 'true')
   dialog.setAttribute('aria-labelledby', 'personalProfileTitle')
   dialog.innerHTML = `
-    <div class="personal-profile-top">
-      <button type="button" class="profile-back" id="backFromMyProfileBtn">${backIcon} Volver</button>
-      <p class="eyebrow">CRASH SOLUTION · TU CUENTA</p>
-      <h2 id="personalProfileTitle">Mi perfil</h2>
-      <p>Tu información personal y tu lugar en el equipo.</p>
-    </div>
-    <div class="personal-profile-layout">
-      <aside class="personal-profile-identity" aria-label="Identidad del usuario">
-        <div class="personal-profile-avatar"><span id="personalProfileInitials">${esc(getProfileInitials(name))}</span>${photo ? `<img id="personalProfilePhoto" src="${esc(photo)}" alt="Foto de perfil" referrerpolicy="no-referrer">` : ''}</div>
-        <h3 id="personalProfileName">${esc(name)}</h3>
-        <span class="personal-profile-role">${personIcon}${esc(roleLabel)}</span>
-        <div class="personal-profile-workshop">${shopIcon}<span>Taller activo<strong>${esc(membership?.workshop?.name || 'Sin taller asignado')}</strong></span></div>
-      </aside>
-      <section class="personal-profile-details" aria-labelledby="personalInfoTitle">
-        <div class="personal-profile-section-heading"><h3 id="personalInfoTitle">Información personal</h3><p>Mantené actualizados tus datos de contacto.</p></div>
-        <div id="personalProfileAlert" class="auth-alert" role="status" aria-live="polite" hidden></div>
-        <form id="personalProfileForm">
-          <div class="personal-profile-fields">
-            <label for="personalName">${personIcon}Nombre completo<input id="personalName" name="display_name" autocomplete="name" required minlength="2" value="${esc(saved.display_name)}" readonly></label>
-            <label for="personalPhone">${phoneIcon}Teléfono<input id="personalPhone" name="phone" type="tel" autocomplete="tel" maxlength="30" value="${esc(saved.phone)}" placeholder="Sin teléfono registrado" readonly></label>
-          </div>
-          <dl class="personal-profile-contact"><div><dt>${mailIcon}Correo electrónico</dt><dd>${esc(user.email || 'Sin correo registrado')}</dd></div></dl>
-          <div class="personal-profile-actions">
-            <button type="button" class="button secondary" id="editPersonalProfileBtn">${editIcon}Editar mis datos</button>
-            <button type="submit" class="button primary" id="savePersonalProfileBtn" hidden>Guardar cambios</button>
-            <button type="button" class="button secondary" id="cancelPersonalProfileBtn" hidden>Cancelar edición</button>
-          </div>
-        </form>
-      </section>
+    <div class="personal-profile-content" id="myProfileDialogContent">
+      <div class="personal-profile-top">
+        <button type="button" class="profile-back" id="backFromMyProfileBtn">${backIcon} Volver</button>
+        <p class="eyebrow">CRASH SOLUTION · TU CUENTA</p>
+        <h2 id="personalProfileTitle">Mi perfil</h2>
+        <p>Tu información personal y tu lugar en el equipo.</p>
+      </div>
+      <div class="personal-profile-layout">
+        <aside class="personal-profile-identity" aria-label="Identidad del usuario">
+          <div class="personal-profile-avatar"><span id="personalProfileInitials">${esc(getProfileInitials(name))}</span>${photo ? `<img id="personalProfilePhoto" src="${esc(photo)}" alt="Foto de perfil" referrerpolicy="no-referrer">` : ''}</div>
+          <h3 id="personalProfileName">${esc(name)}</h3>
+          <span class="personal-profile-role">${personIcon}${esc(roleLabel)}</span>
+          <div class="personal-profile-workshop">${shopIcon}<span>Taller activo<strong>${esc(membership?.workshop?.name || 'Sin taller asignado')}</strong></span></div>
+        </aside>
+        <section class="personal-profile-details" aria-labelledby="personalInfoTitle">
+          <div class="personal-profile-section-heading"><h3 id="personalInfoTitle">Información personal</h3><p>Mantené actualizados tus datos de contacto.</p></div>
+          <div id="personalProfileAlert" class="auth-alert" role="status" aria-live="polite" hidden></div>
+          <form id="personalProfileForm">
+            <div class="personal-profile-fields">
+              <label for="personalName">${personIcon}Nombre completo<input id="personalName" name="display_name" autocomplete="name" required minlength="2" value="${esc(saved.display_name)}" readonly></label>
+              <label for="personalPhone">${phoneIcon}Teléfono<input id="personalPhone" name="phone" type="tel" autocomplete="tel" maxlength="30" value="${esc(saved.phone)}" placeholder="Sin teléfono registrado" readonly></label>
+            </div>
+            <dl class="personal-profile-contact"><div><dt>${mailIcon}Correo electrónico</dt><dd id="personalProfileEmailValue">${esc(user.email || 'Sin correo registrado')}</dd></div></dl>
+            <div class="personal-profile-actions">
+              <button type="button" class="button secondary" id="editPersonalProfileBtn">${editIcon}Editar mis datos</button>
+              <button type="submit" class="button primary" id="savePersonalProfileBtn" hidden>Guardar cambios</button>
+              <button type="button" class="button secondary" id="cancelPersonalProfileBtn" hidden>Cancelar edición</button>
+            </div>
+          </form>
+        </section>
+      </div>
     </div>`
   document.body.append(dialog)
+  const contentEl = dialog.querySelector('#myProfileDialogContent')
   const nameInput = dialog.querySelector('#personalName')
   const phoneInput = dialog.querySelector('#personalPhone')
   const alert = dialog.querySelector('#personalProfileAlert')
   const saveButton = dialog.querySelector('#savePersonalProfileBtn')
   let saving = false
+  let pointerStartedInside = false
+  const isPointInsideContent = event => {
+    if (!contentEl) return false
+    const rect = contentEl.getBoundingClientRect()
+    if (!rect || rect.width <= 0 || rect.height <= 0) return false
+    if (event.clientX === 0 && event.clientY === 0) return false
+    return (
+      event.clientX >= rect.left &&
+      event.clientX <= rect.right &&
+      event.clientY >= rect.top &&
+      event.clientY <= rect.bottom
+    )
+  }
   const setEditing = editing => {
     nameInput.readOnly = phoneInput.readOnly = !editing
     dialog.querySelector('#editPersonalProfileBtn').hidden = editing
@@ -1330,10 +1477,42 @@ export function openMyProfile() {
     if (dirty() && !window.confirm('Tenés cambios en tu perfil sin guardar. ¿Querés descartarlos y volver?')) return
     dialog.close()
     dialog.remove()
-    document.getElementById('profileMenuToggle')?.focus()
+    const menuToggle = document.getElementById('profileMenuToggle')
+    if (menuToggle && menuToggle.isConnected) {
+      menuToggle.focus()
+    } else if (returnFocusTarget && returnFocusTarget.isConnected) {
+      returnFocusTarget.focus()
+    }
   }
+  const markPointerOrigin = event => {
+    if (
+      (contentEl && contentEl.contains(event.target)) ||
+      event.target?.closest?.('#appErrorModal') ||
+      isPointInsideContent(event)
+    ) {
+      pointerStartedInside = true
+    } else if (event.target === dialog) {
+      pointerStartedInside = false
+    }
+  }
+  dialog.addEventListener('pointerdown', markPointerOrigin)
+  dialog.addEventListener('mousedown', markPointerOrigin)
+  dialog.addEventListener('click', event => {
+    if (pointerStartedInside) {
+      pointerStartedInside = false
+      return
+    }
+    if (isErrorModalOpen() || event.target?.closest?.('#appErrorModal')) return
+    if (event.target !== dialog) return
+    if (isPointInsideContent(event)) return
+    close()
+  })
   dialog.querySelector('#backFromMyProfileBtn').onclick = close
-  dialog.addEventListener('cancel', event => { event.preventDefault(); close() })
+  dialog.addEventListener('cancel', event => {
+    if (isErrorModalOpen()) return
+    event.preventDefault()
+    close()
+  })
   dialog.querySelector('#personalProfilePhoto')?.addEventListener('error', event => { event.target.remove() }, { once: true })
   dialog.querySelector('#editPersonalProfileBtn').onclick = () => { alert.hidden = true; setEditing(true); nameInput.focus() }
   dialog.querySelector('#cancelPersonalProfileBtn').onclick = () => {
@@ -1400,11 +1579,12 @@ export function renderHeaderNavigation() {
     window.__headerMenuController?.abort()
     document.getElementById('myProfileDialog')?.remove()
     document.getElementById('settingsScreen')?.replaceChildren()
-    const brand = document.querySelector('.brand span:nth-child(2)')
-    if (brand) brand.innerHTML = 'CRASH SOLUTION<small>Gestión del taller</small>'
+    renderHeaderBrand({ forceGeneric: true })
     navContainer.innerHTML = ''
     return
   }
+
+  renderHeaderBrand()
 
   const activeMembership = getActiveMembership()
   const role = activeMembership?.role || 'sin taller'
@@ -1568,9 +1748,19 @@ export async function switchActiveWorkshop(targetWorkshopId) {
   }
 
   // 2. Activar el nuevo taller y aislar cachés/estados
+  headerBrandVersion++
   appAuthState.activeWorkshopId = targetWorkshopId
   appAuthState.activeWorkshopProfile = targetMembership.workshop ? { ...targetMembership.workshop } : null
   clearWorkshopReadState()
+  appAuthState.activeWorkshopProfile = targetMembership.workshop ? { ...targetMembership.workshop } : null
+  if (window.store) {
+    window.store.shop = {
+      ...DEFAULT_GENERIC_SHOP,
+      ...(targetMembership.workshop || {}),
+      logo_url: targetMembership.workshop?.logo_url || ''
+    }
+  }
+  renderHeaderBrand({ workshop: appAuthState.activeWorkshopProfile })
   privateReadCache.activate({ userId, workshopId: targetWorkshopId })
   localStorage.setItem('mitaller_active_workshop_id', targetWorkshopId)
   appAuthState.workshopSettings = getWorkshopSettings(targetWorkshopId)
@@ -1622,6 +1812,7 @@ export async function switchActiveWorkshop(targetWorkshopId) {
 
 export async function syncActiveWorkshopToLegacyStore({ useMembership = false } = {}) {
   const expectedScope = routeScope()
+  const expectedBrandVersion = headerBrandVersion
   const cacheToken = privateReadCache.token()
   const activeMembership = getActiveMembership()
   if (!activeMembership?.workshop || !window.store) return
@@ -1642,7 +1833,14 @@ export async function syncActiveWorkshopToLegacyStore({ useMembership = false } 
     appAuthState.activeWorkshopProfile = ws
   }
 
-  if (routeScope() !== expectedScope) return
+  if (
+    routeScope() !== expectedScope ||
+    expectedBrandVersion !== headerBrandVersion ||
+    !appAuthState.user ||
+    isSessionExpired(appAuthState.session)
+  ) {
+    return
+  }
   window.store.shop = {
     ...window.store.shop,
     id: ws.id,
@@ -1657,11 +1855,7 @@ export async function syncActiveWorkshopToLegacyStore({ useMembership = false } 
     address: ws.address || ''
   }
 
-  // Actualizar marca en el header si hay nombre comercial del taller
-  const brandTitleEl = document.querySelector('.brand span:nth-child(2)')
-  if (brandTitleEl && ws.name) {
-    brandTitleEl.innerHTML = `${esc(ws.name.toUpperCase())}<small>${esc(ws.legal_name || 'Gestión del taller')}</small>`
-  }
+  renderHeaderBrand({ workshop: ws })
 }
 
 export async function syncPendingJobsWithSupabase({ manual = false } = {}) {
@@ -3538,24 +3732,36 @@ export async function renderSettingsScreen() {
     `
   }
 
+  const currentUserEmail = String(appAuthState.user?.email || '').trim().toLowerCase()
+  const storedPendingEmail = readPendingEmailChange()
+  const matchingStoredPending =
+    storedPendingEmail &&
+    appAuthState.user?.id &&
+    String(storedPendingEmail.userId) === String(appAuthState.user.id)
+      ? storedPendingEmail.newEmail
+      : ''
+  const pendingNewEmail = String(appAuthState.user?.new_email || matchingStoredPending || '')
+    .trim()
+    .toLowerCase()
+  const showPendingEmailNotice = Boolean(pendingNewEmail && pendingNewEmail !== currentUserEmail)
+
   settingsScreen.innerHTML = `
     <div class="personal-profile-top unified-screen-top">
       <div class="unified-screen-top-bar">
         <button type="button" class="profile-back" id="backFromSettingsBtn">← Volver</button>
       </div>
       <p class="eyebrow">CRASH SOLUTION · CONFIGURACIÓN</p>
-      <h1>Configuración</h1>
-      <p>Seguridad de tu cuenta, cambio de contraseña, parámetros operativos del taller y copias de respaldo.</p>
+      <h1 class="settings-top-title">Configuración</h1>
     </div>
 
     <div id="settingsAlertBox" class="auth-alert" role="alert" hidden></div>
 
     <div class="admin-grid settings-grid">
-      <!-- Columna 1: Seguridad y Contraseña -->
+      <!-- Columna 1: Seguridad, Contraseña y Correo electrónico -->
       <div class="admin-card">
         <span class="eyebrow">SEGURIDAD DE LA CUENTA</span>
         <h2>Cambiar contraseña</h2>
-        <p class="subtitle">Actualizá la clave de acceso de tu cuenta (${esc(appAuthState.user?.email || 'usuario autenticado')}).</p>
+        <p class="subtitle">Actualizá la clave de acceso de tu cuenta (<span id="settingsPasswordAccountEmail">${esc(currentUserEmail || 'usuario autenticado')}</span>).</p>
 
         <form id="settingsPasswordForm" class="auth-form" style="margin-top:16px">
           <label>Nueva contraseña (mínimo 8 caracteres) <span class="required">*</span>
@@ -3566,6 +3772,29 @@ export async function renderSettingsScreen() {
           </label>
           <button type="submit" class="button primary" id="settingsUpdatePassBtn">Guardar nueva contraseña</button>
         </form>
+
+        <div id="settingsEmailSection" class="settings-account-section">
+          <span class="eyebrow">CORREO DE LA CUENTA</span>
+          <h2>Cambiar correo electrónico</h2>
+          <p class="subtitle">Tu correo actual se mantiene activo hasta que confirmes el cambio desde los enlaces de verificación enviados por correo.</p>
+
+          <div class="settings-current-email-box">
+            <span class="settings-current-email-label">Correo actual</span>
+            <strong id="settingsCurrentEmail">${esc(currentUserEmail || 'Sin correo registrado')}</strong>
+            ${
+              showPendingEmailNotice
+                ? `<p id="settingsPendingEmailNotice" class="settings-pending-email-pill" role="status">Cambio pendiente de confirmación a <b>${esc(pendingNewEmail)}</b>. Revisá tu casilla (y Spam) para confirmarlo.</p>`
+                : ''
+            }
+          </div>
+
+          <form id="settingsEmailForm" class="auth-form" novalidate style="margin-top:14px">
+            <label for="settingsNewEmail">Nuevo correo electrónico <span class="required">*</span>
+              <input id="settingsNewEmail" type="email" required autocomplete="email" maxlength="254" placeholder="nuevo@correo.com">
+            </label>
+            <button type="submit" class="button secondary" id="settingsUpdateEmailBtn">Cambiar correo electrónico</button>
+          </form>
+        </div>
 
         <details class="quiet-details" open>
           <summary>Copia de respaldo (Exportar / Importar)</summary>
@@ -3644,6 +3873,70 @@ export async function renderSettingsScreen() {
     }
   })
 
+  document.getElementById('settingsEmailForm')?.addEventListener('submit', async e => {
+    e.preventDefault()
+    const btn = document.getElementById('settingsUpdateEmailBtn')
+    if (btn?.disabled) return
+    const emailInput = document.getElementById('settingsNewEmail')
+    const requestedEmail = emailInput?.value
+    setSettingsAlert('', '')
+    if (btn) {
+      btn.disabled = true
+      btn.textContent = 'Solicitando cambio…'
+    }
+    try {
+      const result = await requestUserEmailChange(requestedEmail, {
+        expectedUserId: appAuthState.user?.id || null,
+        expectedEmail: appAuthState.user?.email || null
+      })
+
+      if (result.user) {
+        appAuthState.user = { ...appAuthState.user, ...result.user }
+        if (appAuthState.session) {
+          appAuthState.session = { ...appAuthState.session, user: appAuthState.user }
+        }
+      }
+
+      if (result.requiresEmailConfirmation) {
+        recordPendingEmailChange({
+          userId: appAuthState.user?.id,
+          currentEmail: result.currentEmail,
+          newEmail: result.pendingEmail
+        })
+        if (emailInput) emailInput.value = ''
+        const currentEmailEl = document.getElementById('settingsCurrentEmail')
+        if (currentEmailEl && result.currentEmail) currentEmailEl.textContent = result.currentEmail
+        let pendingEl = document.getElementById('settingsPendingEmailNotice')
+        if (!pendingEl) {
+          pendingEl = document.createElement('p')
+          pendingEl.id = 'settingsPendingEmailNotice'
+          pendingEl.className = 'settings-pending-email-pill'
+          pendingEl.setAttribute('role', 'status')
+          document.querySelector('.settings-current-email-box')?.appendChild(pendingEl)
+        }
+        pendingEl.innerHTML = `Cambio pendiente de confirmación a <b>${esc(result.pendingEmail)}</b>. Revisá tu casilla (y Spam) para confirmarlo.`
+        setSettingsAlert('info', result.message)
+      } else {
+        clearPendingEmailChange()
+        if (emailInput) emailInput.value = ''
+        const currentEmailEl = document.getElementById('settingsCurrentEmail')
+        if (currentEmailEl) currentEmailEl.textContent = result.currentEmail
+        const passEmailEl = document.getElementById('settingsPasswordAccountEmail')
+        if (passEmailEl) passEmailEl.textContent = result.currentEmail
+        document.getElementById('settingsPendingEmailNotice')?.remove()
+        setSettingsAlert('success', result.message)
+        window.toast?.(result.message)
+      }
+    } catch (err) {
+      setSettingsAlert('error', err.message || 'No se pudo iniciar el cambio de correo electrónico.')
+    } finally {
+      if (btn) {
+        btn.disabled = false
+        btn.textContent = 'Cambiar correo electrónico'
+      }
+    }
+  })
+
   document.getElementById('workshopSettingsForm')?.addEventListener('submit', e => {
     e.preventDefault()
     setSettingsAlert('', '')
@@ -3688,12 +3981,15 @@ export async function renderSettingsScreen() {
 }
 
 async function handleExpiredSession() {
+  resetHeaderBrandToGeneric()
   privateReadCache.clear()
   appAuthState.session = null
   appAuthState.user = null
   appAuthState.profile = null
   appAuthState.memberships = []
+  appAuthState.activeWorkshopId = null
   appAuthState.activeWorkshopProfile = null
+  localStorage.removeItem('mitaller_active_workshop_id')
   appAuthState.isSessionBootstrapped = false
   await enforceRouteProtection('Tu sesión expiró por seguridad. Volvé a iniciar sesión para continuar.')
 }
@@ -3755,6 +4051,7 @@ async function onSessionEstablished(session) {
 }
 
 async function initializeAuthenticatedSession(session) {
+  resetHeaderBrandToGeneric()
   privateReadCache.clear()
   clearWorkshopReadState()
   appAuthState.session = session
@@ -4545,6 +4842,15 @@ export async function initAuthAndAdmin() {
         }
       : liveCallback
 
+  const pendingEmailChange = readPendingEmailChange()
+  const isPotentialEmailChangeCallback = Boolean(
+    callbackInfo.isEmailChangeFlow ||
+      (callbackInfo.hasCallbackError &&
+        !callbackInfo.isPasswordSetupFlow &&
+        !callbackInfo.hasUpdatePasswordRoute &&
+        pendingEmailChange?.userId)
+  )
+
   initialRecoveryRequested = initialRecoveryRequested || Boolean(callbackInfo.isPasswordSetupFlow)
   wireEnhancedBudgetAndSettings()
 
@@ -4571,12 +4877,13 @@ export async function initAuthAndAdmin() {
   // Si se abrió un enlace de invitación o recuperación mientras había otro usuario conectado en memoria,
   // aislar de inmediato la sesión anterior antes de resolver la nueva identidad.
   const preExistingUserId = callbackInfo.preExistingUserId || appAuthState.user?.id || null
-  if (callbackInfo.isAuthCallback && preExistingUserId && appAuthState.user?.id === preExistingUserId) {
+  if (callbackInfo.isAuthCallback && !isPotentialEmailChangeCallback && preExistingUserId && appAuthState.user?.id === preExistingUserId) {
     const prevMembership = getActiveMembership()
     await lockOfflineDataOnLogout({
       userId: preExistingUserId,
       workshopId: prevMembership?.workshop_id || null
     }).catch(() => {})
+    resetHeaderBrandToGeneric()
     privateReadCache.clear()
     clearWorkshopReadState()
     clearNavigationState()
@@ -4584,11 +4891,25 @@ export async function initAuthAndAdmin() {
     appAuthState.user = null
     appAuthState.profile = null
     appAuthState.memberships = []
+    appAuthState.activeWorkshopId = null
     appAuthState.activeWorkshopProfile = null
+    localStorage.removeItem('mitaller_active_workshop_id')
     appAuthState.isSessionBootstrapped = false
   }
 
-  if (callbackInfo.isAuthCallback) {
+  const { data, error } = await supabase.auth.getSession()
+
+  const isEmailChangeCallback = Boolean(
+    callbackInfo.isEmailChangeFlow ||
+      (callbackInfo.hasCallbackError &&
+        !callbackInfo.isPasswordSetupFlow &&
+        !callbackInfo.hasUpdatePasswordRoute &&
+        pendingEmailChange?.userId &&
+        data?.session?.user?.id &&
+        String(pendingEmailChange.userId) === String(data.session.user.id))
+  )
+
+  if (callbackInfo.isAuthCallback && !isEmailChangeCallback) {
     appAuthState.passwordFlowContext = {
       flowType: callbackInfo.type === 'recovery' ? 'recovery' : 'invite',
       verified: false,
@@ -4601,9 +4922,39 @@ export async function initAuthAndAdmin() {
     }
   }
 
-  const { data, error } = await supabase.auth.getSession()
+  if (isEmailChangeCallback) {
+    const verification = await verifyEmailChangeCallback({
+      supabaseClient: supabase,
+      callbackInfo,
+      currentSession: data?.session || null
+    })
+    clearCapturedInitialCallback()
 
-  if (callbackInfo.isAuthCallback) {
+    const sessionToUse = verification.session || data?.session || null
+    if (sessionToUse?.user?.id && !isSessionExpired(sessionToUse)) {
+      if (window.history?.replaceState) {
+        window.history.replaceState(null, '', `${window.location.pathname}#/configuracion`)
+      }
+      await onSessionEstablished(sessionToUse)
+      await navigateAppRoute({ name: 'settings' }, { replace: true })
+      if (!verification.ok) {
+        setSettingsAlert('error', verification.error || 'No se pudo confirmar el cambio de correo electrónico.')
+      } else if (verification.confirmed) {
+        clearPendingEmailChange()
+        setSettingsAlert('success', verification.message)
+        window.toast?.(verification.message)
+      } else {
+        setSettingsAlert('info', verification.message)
+      }
+    } else {
+      if (window.history?.replaceState) {
+        window.history.replaceState(null, '', window.location.pathname)
+      }
+      await enforceRouteProtection(
+        verification.error || 'No se pudo confirmar el cambio de correo electrónico. Iniciá sesión para intentarlo nuevamente.'
+      )
+    }
+  } else if (callbackInfo.isAuthCallback) {
     const verification = await establishAndVerifyCallbackSession({
       supabaseClient: supabase,
       callbackInfo,
@@ -4686,6 +5037,8 @@ export async function initAuthAndAdmin() {
       return
     }
     if (event === 'SIGNED_OUT') {
+      resetHeaderBrandToGeneric()
+      clearPendingEmailChange()
       privateReadCache.clear()
       clearWorkshopReadState()
       appAuthState.authMode = 'login'
@@ -4707,12 +5060,15 @@ export async function initAuthAndAdmin() {
       appAuthState.user = null
       appAuthState.profile = null
       appAuthState.memberships = []
+      appAuthState.activeWorkshopId = null
       appAuthState.activeWorkshopProfile = null
+      localStorage.removeItem('mitaller_active_workshop_id')
       appAuthState.isSessionBootstrapped = false
       appAuthState.pendingSyncCount = 0
       appAuthState.unresolvedConflicts = []
       appAuthState.activePieceKey = null
       appAuthState.openPieceDetailsKeys = []
+      renderHeaderNavigation()
       routeInitializedFor = null
       await getAppRouter().navigate({ name: 'jobs' }, { replace: true })
       return
@@ -4722,7 +5078,11 @@ export async function initAuthAndAdmin() {
         appAuthState.passwordFlowContext?.callbackInfo ||
         (parseAuthCallbackUrl(window.location).isAuthCallback ? parseAuthCallbackUrl(window.location) : null)
 
-      if (activeCallbackInfo && (appAuthState.passwordFlowContext?.pending || isPasswordSetupCallback(window.location))) {
+      if (
+        activeCallbackInfo &&
+        !activeCallbackInfo.isEmailChangeFlow &&
+        (appAuthState.passwordFlowContext?.pending || isPasswordSetupCallback(window.location))
+      ) {
         const verification = await establishAndVerifyCallbackSession({
           supabaseClient: supabase,
           callbackInfo: activeCallbackInfo,
@@ -4752,6 +5112,21 @@ export async function initAuthAndAdmin() {
       })
       appAuthState.session = session
       appAuthState.user = session?.user || appAuthState.user
+      if (event === 'USER_UPDATED' && session?.user) {
+        const pendingRec = readPendingEmailChange()
+        const updatedEmail = String(session.user.email || '').trim().toLowerCase()
+        const stillPendingEmail = String(session.user.new_email || '').trim().toLowerCase()
+        if (!stillPendingEmail && pendingRec && updatedEmail === pendingRec.newEmail) {
+          clearPendingEmailChange()
+        }
+        const currentEmailEl = document.getElementById('settingsCurrentEmail')
+        if (currentEmailEl && updatedEmail) currentEmailEl.textContent = updatedEmail
+        const passEmailEl = document.getElementById('settingsPasswordAccountEmail')
+        if (passEmailEl && updatedEmail) passEmailEl.textContent = updatedEmail
+        if (!stillPendingEmail) document.getElementById('settingsPendingEmailNotice')?.remove()
+        const profileEmailEl = document.getElementById('personalProfileEmailValue')
+        if (profileEmailEl && updatedEmail) profileEmailEl.textContent = updatedEmail
+      }
       if (shouldReinit || initialRecoveryRequested) {
         await onSessionEstablished(session)
       }

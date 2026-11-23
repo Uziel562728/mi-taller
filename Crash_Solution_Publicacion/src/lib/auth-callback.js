@@ -5,6 +5,7 @@
 
 const AUTH_STORAGE_KEY = 'mitaller_supabase_auth'
 const CONSUMED_TOKENS_STORAGE_KEY = 'mitaller_consumed_auth_tokens_v1'
+const PENDING_EMAIL_CHANGE_KEY = 'mitaller_pending_email_change_v1'
 
 let capturedInitialCallback = null
 
@@ -83,6 +84,46 @@ export function clearConsumedTokens(storage = globalThis.sessionStorage) {
   }
 }
 
+export function recordPendingEmailChange(
+  { userId, currentEmail = '', newEmail = '' } = {},
+  storage = globalThis.sessionStorage
+) {
+  if (!userId || !newEmail || !storage || typeof storage.setItem !== 'function') return null
+  const record = {
+    userId: String(userId),
+    currentEmail: String(currentEmail || '').trim().toLowerCase(),
+    newEmail: String(newEmail || '').trim().toLowerCase(),
+    requestedAt: Date.now()
+  }
+  try {
+    storage.setItem(PENDING_EMAIL_CHANGE_KEY, JSON.stringify(record))
+  } catch {
+    // Ignore storage quota errors
+  }
+  return record
+}
+
+export function readPendingEmailChange(storage = globalThis.sessionStorage) {
+  if (!storage || typeof storage.getItem !== 'function') return null
+  try {
+    const raw = storage.getItem(PENDING_EMAIL_CHANGE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    if (!parsed?.userId || !parsed?.newEmail) return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+export function clearPendingEmailChange(storage = globalThis.sessionStorage) {
+  try {
+    storage?.removeItem?.(PENDING_EMAIL_CHANGE_KEY)
+  } catch {
+    // Ignore
+  }
+}
+
 /**
  * Analiza cualquier URL de retorno de correo electrónico de Supabase Auth, incluyendo:
  * - Hashes compuestos como `#update-password#access_token=...&type=invite`
@@ -101,10 +142,13 @@ export function parseAuthCallbackUrl(locationLike = globalThis.window?.location)
       error: '',
       errorCode: '',
       errorDescription: '',
+      message: '',
       hasUpdatePasswordRoute: false,
       hasDoubleHash: false,
       jwtClaims: null,
       isPasswordSetupFlow: false,
+      isEmailChangeFlow: false,
+      hasEmailChangeMessage: false,
       hasCallbackCredentials: false,
       hasCallbackError: false,
       isAuthCallback: false,
@@ -146,6 +190,9 @@ export function parseAuthCallbackUrl(locationLike = globalThis.window?.location)
       hasUpdatePasswordRoute = true
       continue
     }
+    if (cleanSeg === '/configuracion' || cleanSeg === 'configuracion') {
+      continue
+    }
     // Si un segmento empieza con "update-password&access_token=..."
     let queryPart = cleanSeg
     if (/^(update-password|activar-cuenta)&/i.test(cleanSeg)) {
@@ -170,12 +217,15 @@ export function parseAuthCallbackUrl(locationLike = globalThis.window?.location)
   const error = String(mergedParams.get('error') || '').trim()
   const errorCode = String(mergedParams.get('error_code') || '').trim().toLowerCase()
   const errorDescription = String(mergedParams.get('error_description') || '').trim()
+  const message = String(mergedParams.get('message') || '').trim()
 
   const jwtClaims = accessToken ? decodeJwtPayload(accessToken) : null
   const isPasswordSetupFlow = ['invite', 'recovery'].includes(type)
+  const hasEmailChangeMessage = Boolean(message && /confirm.*link.*accepted|other email|confirm.*email/i.test(message))
+  const isEmailChangeFlow = Boolean(type === 'email_change' || hasEmailChangeMessage)
   const hasCallbackCredentials = Boolean(accessToken || tokenHash || code)
   const hasCallbackError = Boolean(error || errorCode || errorDescription)
-  const isAuthCallback = Boolean(isPasswordSetupFlow || hasCallbackCredentials || hasCallbackError)
+  const isAuthCallback = Boolean(isPasswordSetupFlow || isEmailChangeFlow || hasCallbackCredentials || hasCallbackError)
 
   let normalizedHash = hashStr
   if (hasDoubleHash && paramSegments.length > 0) {
@@ -193,10 +243,13 @@ export function parseAuthCallbackUrl(locationLike = globalThis.window?.location)
     error,
     errorCode,
     errorDescription,
+    message,
     hasUpdatePasswordRoute,
     hasDoubleHash,
     jwtClaims,
     isPasswordSetupFlow,
+    isEmailChangeFlow,
+    hasEmailChangeMessage,
     hasCallbackCredentials,
     hasCallbackError,
     isAuthCallback,
@@ -258,6 +311,7 @@ export function prepareInitialAuthCallbackInWindow(
     // Si hay credenciales de invitación o recuperación en la URL y existe una sesión previa en localStorage
     // que pertenece a otro usuario, limpiamos la clave de sesión en localStorage ANTES de que Supabase la lea.
     if (
+      !parsed.isEmailChangeFlow &&
       storedSession?.userId &&
       (parsed.hasCallbackCredentials || parsed.isPasswordSetupFlow) &&
       (!parsed.jwtClaims?.sub || String(parsed.jwtClaims.sub) !== String(storedSession.userId))
@@ -306,6 +360,23 @@ export function translateCallbackError({
   const codeLower = String(errorCode || error || '').toLowerCase()
   const descLower = String(errorDescription || '').toLowerCase()
   const isInvite = flowType === 'invite'
+  const isEmailChange = flowType === 'email_change'
+
+  if (isEmailChange) {
+    if (codeLower === 'identity_mismatch') {
+      return 'Bloqueo de seguridad: el enlace de cambio de correo pertenece a otra cuenta distinta a la sesión activa. No se modificó tu correo ni tu sesión.'
+    }
+    if (
+      codeLower.includes('otp_expired') ||
+      codeLower.includes('flow_state_expired') ||
+      codeLower.includes('email_change_token_expired') ||
+      descLower.includes('expired') ||
+      descLower.includes('invalid')
+    ) {
+      return 'El enlace de confirmación de cambio de correo expiró o ya fue utilizado. Tu correo electrónico actual no fue modificado; solicitá un nuevo cambio desde Configuración.'
+    }
+    return 'No se pudo confirmar el cambio de correo electrónico. Tu correo actual permanece sin cambios.'
+  }
 
   if (codeLower === 'token_already_used' || codeLower === 'already_used') {
     return isInvite
@@ -587,5 +658,207 @@ export async function establishAndVerifyCallbackSession({
       user: verifiedUser
     },
     user: verifiedUser
+  }
+}
+
+/**
+ * Verifica el retorno de un enlace de confirmación de cambio de correo electrónico de Supabase Auth.
+ * Respeta el flujo de confirmación simple o doble de Supabase y nunca afirma que el correo
+ * cambió si todavía queda pendiente una segunda confirmación o si el enlace venció/falló.
+ */
+export async function verifyEmailChangeCallback({
+  supabaseClient,
+  callbackInfo,
+  currentSession = null
+} = {}) {
+  const info = callbackInfo || parseAuthCallbackUrl()
+
+  if (info.hasCallbackError) {
+    return {
+      ok: false,
+      confirmed: false,
+      blocked: true,
+      flowType: 'email_change',
+      errorCode: info.errorCode || 'CALLBACK_ERROR',
+      error: translateCallbackError({
+        error: info.error,
+        errorCode: info.errorCode,
+        errorDescription: info.errorDescription,
+        flowType: 'email_change'
+      })
+    }
+  }
+
+  if (info.hasEmailChangeMessage && !info.hasCallbackCredentials) {
+    return {
+      ok: true,
+      confirmed: false,
+      requiresSecondConfirmation: true,
+      flowType: 'email_change',
+      session: currentSession,
+      user: currentSession?.user || null,
+      message:
+        'Primera confirmación aceptada. Abrí el enlace enviado a la otra dirección de correo para completar el cambio. Tu correo actual seguirá vigente hasta confirmar ambos enlaces.'
+    }
+  }
+
+  if (currentSession?.user?.id && info.jwtClaims?.sub && String(info.jwtClaims.sub) !== String(currentSession.user.id)) {
+    return {
+      ok: false,
+      confirmed: false,
+      blocked: true,
+      flowType: 'email_change',
+      errorCode: 'IDENTITY_MISMATCH',
+      error: translateCallbackError({ errorCode: 'identity_mismatch', flowType: 'email_change' })
+    }
+  }
+
+  let activeSession = currentSession
+  let verifiedUser = currentSession?.user || null
+
+  if (info.tokenHash && info.type === 'email_change' && typeof supabaseClient?.auth?.verifyOtp === 'function') {
+    const { data, error } = await supabaseClient.auth.verifyOtp({
+      token_hash: info.tokenHash,
+      type: 'email_change'
+    })
+    if (error || !data?.user?.id) {
+      return {
+        ok: false,
+        confirmed: false,
+        blocked: true,
+        flowType: 'email_change',
+        errorCode: error?.code || 'OTP_INVALID',
+        error: translateCallbackError({
+          error: error?.message,
+          errorCode: error?.code || 'otp_expired',
+          errorDescription: error?.message,
+          flowType: 'email_change'
+        })
+      }
+    }
+    activeSession = data.session || activeSession
+    verifiedUser = data.user
+  } else if (info.code && typeof supabaseClient?.auth?.exchangeCodeForSession === 'function') {
+    const { data, error } = await supabaseClient.auth.exchangeCodeForSession(info.code)
+    if (error || !data?.user?.id) {
+      return {
+        ok: false,
+        confirmed: false,
+        blocked: true,
+        flowType: 'email_change',
+        errorCode: error?.code || 'CODE_INVALID',
+        error: translateCallbackError({
+          error: error?.message,
+          errorCode: error?.code || 'otp_expired',
+          errorDescription: error?.message,
+          flowType: 'email_change'
+        })
+      }
+    }
+    activeSession = data.session || activeSession
+    verifiedUser = data.user
+  } else if (info.accessToken) {
+    if (
+      info.refreshToken &&
+      typeof supabaseClient?.auth?.setSession === 'function' &&
+      activeSession?.access_token !== info.accessToken
+    ) {
+      const { data, error } = await supabaseClient.auth.setSession({
+        access_token: info.accessToken,
+        refresh_token: info.refreshToken
+      })
+      if (error || !data?.session?.user?.id) {
+        return {
+          ok: false,
+          confirmed: false,
+          blocked: true,
+          flowType: 'email_change',
+          errorCode: error?.code || 'SESSION_INVALID',
+          error: translateCallbackError({
+            error: error?.message,
+            errorCode: error?.code || 'otp_expired',
+            errorDescription: error?.message,
+            flowType: 'email_change'
+          })
+        }
+      }
+      activeSession = data.session
+      verifiedUser = data.session.user
+    }
+
+    if (typeof supabaseClient?.auth?.getUser === 'function') {
+      const tokenToCheck = activeSession?.access_token || info.accessToken
+      const { data: userData, error: userErr } = await supabaseClient.auth.getUser(tokenToCheck)
+      if (userErr || !userData?.user?.id) {
+        return {
+          ok: false,
+          confirmed: false,
+          blocked: true,
+          flowType: 'email_change',
+          errorCode: userErr?.code || 'SERVER_VERIFY_FAILED',
+          error: translateCallbackError({
+            error: userErr?.message,
+            errorCode: userErr?.code || 'otp_expired',
+            errorDescription: userErr?.message,
+            flowType: 'email_change'
+          })
+        }
+      }
+      verifiedUser = userData.user
+      if (activeSession) {
+        activeSession = { ...activeSession, user: verifiedUser }
+      }
+    }
+  }
+
+  if (!verifiedUser?.id) {
+    return {
+      ok: false,
+      confirmed: false,
+      blocked: true,
+      flowType: 'email_change',
+      errorCode: 'MISSING_SESSION',
+      error: translateCallbackError({ errorCode: 'otp_expired', flowType: 'email_change' })
+    }
+  }
+
+  if (currentSession?.user?.id && String(verifiedUser.id) !== String(currentSession.user.id)) {
+    return {
+      ok: false,
+      confirmed: false,
+      blocked: true,
+      flowType: 'email_change',
+      errorCode: 'IDENTITY_MISMATCH',
+      error: translateCallbackError({ errorCode: 'identity_mismatch', flowType: 'email_change' })
+    }
+  }
+
+  const currentEmail = String(verifiedUser.email || '').trim().toLowerCase()
+  const pendingNewEmail = String(verifiedUser.new_email || '').trim().toLowerCase()
+
+  if (pendingNewEmail && pendingNewEmail !== currentEmail) {
+    return {
+      ok: true,
+      confirmed: false,
+      requiresSecondConfirmation: true,
+      flowType: 'email_change',
+      session: activeSession,
+      user: verifiedUser,
+      currentEmail,
+      pendingEmail: pendingNewEmail,
+      message: `Falta confirmar el enlace enviado a ${pendingNewEmail}. Tu correo actual (${currentEmail}) seguirá vigente hasta completar la verificación.`
+    }
+  }
+
+  return {
+    ok: true,
+    confirmed: true,
+    requiresSecondConfirmation: false,
+    flowType: 'email_change',
+    session: activeSession,
+    user: verifiedUser,
+    currentEmail,
+    pendingEmail: '',
+    message: `Correo electrónico confirmado y actualizado a ${currentEmail}.`
   }
 }

@@ -122,6 +122,7 @@ export function preventSelfPrivilegeEscalation({
 }
 
 export function translateAuthError(error) {
+  const code = String(error?.code || '').toLowerCase()
   const msg = String(error?.message || error || '').toLowerCase()
   if (msg.includes('invalid login credentials')) {
     return 'Correo o contraseña incorrectos. Verificá tus datos e intentá nuevamente.'
@@ -129,8 +130,32 @@ export function translateAuthError(error) {
   if (msg.includes('email not confirmed')) {
     return 'Tu correo electrónico aún no fue confirmado. Revisá tu bandeja de entrada o spam.'
   }
-  if (msg.includes('user already registered') || msg.includes('already been registered')) {
-    return 'Ya existe una cuenta registrada con ese correo electrónico.'
+  if (
+    code === 'email_exists' ||
+    msg.includes('user already registered') ||
+    msg.includes('already been registered') ||
+    msg.includes('already in use') ||
+    msg.includes('duplicate key')
+  ) {
+    return 'Ya existe una cuenta registrada con ese correo electrónico. Ingresá una dirección diferente.'
+  }
+  if (code === 'same_email' || msg.includes('same email') || msg.includes('same_email')) {
+    return 'El nuevo correo electrónico debe ser diferente al correo actual de tu cuenta.'
+  }
+  if (
+    code === 'otp_expired' ||
+    code === 'flow_state_expired' ||
+    code === 'email_change_token_expired' ||
+    msg.includes('email link is invalid or has expired') ||
+    msg.includes('token has expired')
+  ) {
+    return 'El enlace de confirmación de correo electrónico venció o ya fue utilizado. Tu correo actual no fue modificado; solicitá un nuevo cambio desde Configuración.'
+  }
+  if (code === 'email_address_invalid' || msg.includes('unable to validate email address')) {
+    return 'El formato del correo electrónico no es válido.'
+  }
+  if (code === 'email_address_not_authorized') {
+    return 'El servicio de correo no permite enviar mensajes a esa dirección en este momento.'
   }
   if (msg.includes('password should be at least')) {
     return 'La contraseña debe tener al menos 8 caracteres.'
@@ -369,4 +394,103 @@ export async function updateUserPassword(newPassword, confirmPassword, options =
   }
 
   return data?.user || null
+}
+
+export function validateEmailChange(newEmail, currentEmail = '') {
+  const emailCheck = validateEmail(newEmail)
+  if (!emailCheck.valid) return emailCheck
+  if (emailCheck.value.length > 254) {
+    return { valid: false, error: 'El correo electrónico supera la longitud máxima permitida.' }
+  }
+  const normalizedCurrent = String(currentEmail || '').trim().toLowerCase()
+  if (normalizedCurrent && emailCheck.value === normalizedCurrent) {
+    return { valid: false, error: 'El nuevo correo electrónico debe ser diferente a tu correo actual.' }
+  }
+  return { valid: true, value: emailCheck.value }
+}
+
+export async function requestUserEmailChange(newEmail, options = {}) {
+  const client = options.client || supabase
+  if (!client || (!options.client && !isSupabaseConfigured)) {
+    throw new Error('Supabase no está configurado.')
+  }
+
+  const { expectedUserId = null, expectedEmail = null } = options
+  let activeUser = null
+
+  if (typeof client?.auth?.getSession === 'function') {
+    const { data: sessionData, error: sessionErr } = await client.auth.getSession()
+    if (sessionErr) throw new Error(translateAuthError(sessionErr))
+    const activeSession = sessionData?.session || null
+    if (!activeSession?.user?.id || isSessionExpired(activeSession)) {
+      throw new Error('Tu sesión expiró por seguridad. Volvé a iniciar sesión para cambiar tu correo electrónico.')
+    }
+    activeUser = activeSession.user
+  } else if (typeof client?.auth?.getUser === 'function') {
+    const { data: userData, error: userErr } = await client.auth.getUser()
+    if (userErr || !userData?.user?.id) {
+      throw new Error('No hay una sesión activa verificada para cambiar tu correo electrónico.')
+    }
+    activeUser = userData.user
+  } else {
+    throw new Error('El servicio de autenticación no está disponible para actualizar el correo electrónico.')
+  }
+
+  if (expectedUserId && String(activeUser.id) !== String(expectedUserId)) {
+    throw new Error('Bloqueo de seguridad: la sesión activa no coincide con tu cuenta. No se modificó ningún correo.')
+  }
+
+  const currentEmail = String(activeUser.email || expectedEmail || '').trim().toLowerCase()
+  if (
+    expectedEmail &&
+    activeUser.email &&
+    String(activeUser.email).trim().toLowerCase() !== String(expectedEmail).trim().toLowerCase()
+  ) {
+    throw new Error('Bloqueo de seguridad: el correo electrónico de la sesión activa no coincide con tu cuenta.')
+  }
+
+  const check = validateEmailChange(newEmail, currentEmail)
+  if (!check.valid) throw new Error(check.error)
+
+  const emailRedirectTo =
+    options.emailRedirectTo !== undefined
+      ? options.emailRedirectTo
+      : typeof window !== 'undefined'
+        ? applicationUrl(window.location, import.meta.env.BASE_URL)
+        : undefined
+
+  const updateOptions = emailRedirectTo ? { emailRedirectTo } : undefined
+  const { data, error } = await client.auth.updateUser({ email: check.value }, updateOptions)
+  if (error) throw new Error(translateAuthError(error))
+
+  const updatedUser = data?.user || null
+  if (updatedUser?.id && String(updatedUser.id) !== String(activeUser.id)) {
+    throw new Error('No se pudo confirmar el cambio de correo electrónico para tu cuenta.')
+  }
+
+  const returnedEmail = String(updatedUser?.email || '').trim().toLowerCase()
+  const pendingNewEmail = String(updatedUser?.new_email || '').trim().toLowerCase()
+  const confirmed = Boolean(updatedUser?.id && returnedEmail === check.value && !pendingNewEmail)
+
+  if (confirmed) {
+    return {
+      user: updatedUser,
+      confirmed: true,
+      requiresEmailConfirmation: false,
+      currentEmail: check.value,
+      pendingEmail: '',
+      message: `Tu correo electrónico fue actualizado y confirmado a ${check.value}.`
+    }
+  }
+
+  const effectiveCurrent = returnedEmail || currentEmail
+  const effectivePending = pendingNewEmail || check.value
+  return {
+    user: updatedUser,
+    confirmed: false,
+    requiresEmailConfirmation: true,
+    currentEmail: effectiveCurrent,
+    pendingEmail: effectivePending,
+    message: `Enviamos un correo de verificación a ${check.value}. Tu correo actual (${effectiveCurrent}) seguirá vigente hasta que confirmes el enlace recibido. Si tu proyecto tiene doble confirmación habilitada, revisá también tu correo actual (y la carpeta Spam).`
+  }
 }

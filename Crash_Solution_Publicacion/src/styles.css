@@ -719,8 +719,9 @@
 }
 
 /* Personal account card. It overlays the current section without replacing it. */
-.personal-profile-dialog { width: min(860px, calc(100% - 32px)); max-width: 860px; max-height: calc(100dvh - 32px); padding: 0; border: 1px solid #dce5ee; border-radius: 22px; background: #fff; box-shadow: 0 24px 80px #132c4340; overflow-y: auto; }
-.personal-profile-dialog::backdrop { background: #0b2038a6; backdrop-filter: blur(4px); }
+.personal-profile-dialog { width: min(860px, calc(100% - 32px)); max-width: 860px; max-height: calc(100dvh - 32px); padding: 0; border: 1px solid #dce5ee; border-radius: 22px; background: #fff; box-shadow: 0 24px 80px #132c4340; overflow: hidden; }
+.personal-profile-dialog::backdrop { background: #0b2038a6; backdrop-filter: blur(4px); cursor: pointer; }
+.personal-profile-content { max-height: calc(100dvh - 32px); overflow-y: auto; width: 100%; cursor: default; }
 .personal-profile-dialog svg { width: 19px; height: 19px; flex-shrink: 0; vertical-align: middle; }
 .personal-profile-top { padding: 22px 30px 30px; color: #fff; background: radial-gradient(ellipse at top right, #2867d560, transparent 65%), var(--navy); }
 .personal-profile-top .eyebrow { color: #a8caff; margin: 18px 0 7px; }
@@ -755,6 +756,7 @@
 .personal-profile-actions .button { min-height: 44px; }
 @media (max-width: 600px) {
   .personal-profile-dialog { width: calc(100% - 24px); max-height: calc(100dvh - 24px); border-radius: 18px; }
+  .personal-profile-content { max-height: calc(100dvh - 24px); }
   .personal-profile-top { padding: 16px 20px 24px; }
   .personal-profile-top h2 { font-size: 26px; }
   .personal-profile-layout { grid-template-columns: minmax(0, 1fr); }
@@ -1494,4 +1496,131 @@ textarea.input-field-error {
 .activation-account-badge strong {
   font-size: 14px;
   color: var(--navy, #132c43);
+}
+
+/* ==========================================================================
+   ERROR 1 & ERROR 3: Marca pública genérica, logo del taller y correo en Configuración
+   ========================================================================== */
+.brand {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.brand-copy {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.brand-mark {
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.brand-mark.has-workshop-logo {
+  background: #ffffff;
+  border-color: #dce6f1;
+  padding: 3px;
+}
+
+.brand-logo-img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+  border-radius: 6px;
+}
+
+.auth-public-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  margin-bottom: 18px;
+  border-radius: 14px;
+  background: #f4f7fb;
+  border: 1px solid #dce5ef;
+}
+
+.auth-brand-mark {
+  width: 42px;
+  height: 42px;
+  font-size: 28px;
+  color: #ffffff;
+  background: var(--navy, #132c43);
+  border-color: #2c4f6e;
+}
+
+.auth-public-brand-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.auth-public-brand-text strong {
+  font-size: 15px;
+  font-weight: 850;
+  color: var(--navy, #132c43);
+  letter-spacing: 0.01em;
+}
+
+.auth-public-brand-text span {
+  font-size: 11px;
+  color: var(--muted, #718295);
+  font-weight: 600;
+}
+
+.settings-top-title {
+  margin-bottom: 0 !important;
+}
+
+.settings-account-section {
+  margin-top: 24px;
+  padding-top: 22px;
+  border-top: 1px solid var(--line, #e1e7ed);
+}
+
+.settings-current-email-box {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid #d5e1ee;
+  background: #f6f9fc;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.settings-current-email-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #5b7085;
+}
+
+.settings-current-email-box strong {
+  font-size: 14px;
+  color: var(--ink, #1d3348);
+  overflow-wrap: anywhere;
+}
+
+.settings-pending-email-pill {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #edf3fd;
+  border: 1px solid #c5dafc;
+  color: #1c4ca0;
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 680px) {
+  .brand {
+    max-width: calc(100vw - 140px);
+  }
+  .auth-public-brand {
+    padding: 10px 12px;
+  }
 }

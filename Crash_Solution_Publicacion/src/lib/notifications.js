@@ -84,6 +84,10 @@ export function inferErrorDetails(rawMessage = '', section = '') {
   } else if (secKey === 'profile' || lower.includes('logo') || lower.includes('nombre comercial')) {
     title = 'No se pudieron guardar los datos del taller'
     solution = 'Verificá que el Nombre comercial esté completo y que el logo sea una imagen PNG, JPEG o WEBP menor a 2 MB.'
+  } else if (secKey === 'settings' && (lower.includes('correo') || lower.includes('email'))) {
+    title = 'No se pudo actualizar el correo electrónico'
+    solution =
+      'Verificá que el correo tenga un formato válido, que sea distinto al actual y que no pertenezca a otra cuenta. Si el enlace venció, solicitá un nuevo cambio desde Configuración.'
   } else if (secKey === 'settings' || lower.includes('parámetro') || lower.includes('configuración')) {
     title = 'Parámetro de configuración inválido'
     solution = 'Revisá los valores numéricos ingresados en Configuración y volvé a guardar.'
@@ -187,7 +191,10 @@ function detectOffendingFields(rawMessage = '', section = '') {
     return fields
   }
   if (secKey === 'settings') {
-    if (lower.includes('coinciden')) {
+    if (lower.includes('correo') || lower.includes('email')) {
+      const emailEl = document.getElementById('settingsNewEmail')
+      if (emailEl) fields.push({ el: emailEl, hint: 'Ingresá un correo electrónico válido y disponible.' })
+    } else if (lower.includes('coinciden')) {
       const confEl = document.getElementById('settingsConfirmPassword') || document.getElementById('settingsNewPassword')
       if (confEl) fields.push({ el: confEl, hint: 'Las contraseñas deben coincidir.' })
     } else if (lower.includes('contraseña')) {
